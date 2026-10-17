@@ -1,15 +1,15 @@
 --[[
     ╔═══════════════════════════════════════╗
-    ║        RAMDOM HUB  v3.1               ║
+    ║        RAMDOM HUB  v4                 ║
     ║Combat, Home, Auto Mobs, Otimização, Config║
     ╚═══════════════════════════════════════╝
 
-    v3.1:
+    v4:
+      +Auto Mobs
+      +Melhorias na Otimizacao
       - Auto Attack agora é um auto clique de verdade (só clica quando tem mob a 15 studs).
       - Auto Skill com prioridade: a cada 1s aperta as skills marcadas e pausa os cliques enquanto isso.
-      - Auto Mob: só anda até o mob selecionado (sem ataque embutido); ao matar, vai pro próximo do mesmo tipo.
-      - Auto Mob revisado: seleção de um ou mais tipos (só vai nos marcados), um alvo por vez,
-        anda sem teleporte, ignora mob inalcançável e desligar encerra tudo.
+      - Auto Mob: seleção de um ou mais tipos (só vai nos marcados), um alvo por vez, anda sem teleporte.
 ]]
 
 --// Serviços
@@ -40,14 +40,13 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "3.1",
+    Version = "4",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
 }
 
---// UI principal: declarados aqui para os motores (Combat/Auto Mob) enxergarem.
---// Os objetos são criados mais abaixo na seção "UI GRANDE".
+--// UI principal
 local ScreenGui, Main
 
 --// ==========================================
@@ -1457,7 +1456,7 @@ setTab("Home")
 --// ==========================================
 local function createUpdateCard(parent, layoutOrder, titleText, descText)
     local card = Instance.new("Frame")
-    card.Size = UDim2.new(1, 0, 0, 70)
+    card.Size = UDim2.new(1, 0, 0, 90) -- Aumentado para caber as duas linhas
     card.BackgroundColor3 = Theme.Card
     card.BorderSizePixel = 0
     card.LayoutOrder = layoutOrder
@@ -1478,7 +1477,7 @@ local function createUpdateCard(parent, layoutOrder, titleText, descText)
     tLabel.Parent = card
 
     local dLabel = Instance.new("TextLabel")
-    dLabel.Size = UDim2.new(1, -32, 0, 24)
+    dLabel.Size = UDim2.new(1, -32, 0, 45)
     dLabel.Position = UDim2.new(0, 16, 0, 34)
     dLabel.BackgroundTransparency = 1
     dLabel.Text = descText
@@ -1486,14 +1485,14 @@ local function createUpdateCard(parent, layoutOrder, titleText, descText)
     dLabel.Font = Enum.Font.Gotham
     dLabel.TextSize = 13
     dLabel.TextXAlignment = Enum.TextXAlignment.Left
-    dLabel.TextWrapped = true
     dLabel.TextYAlignment = Enum.TextYAlignment.Top
+    dLabel.TextWrapped = true
     dLabel.Parent = card
 
     return card
 end
 
-createUpdateCard(HomePage, 1, "v3.1", "Auto Mob Adicionado")
+createUpdateCard(HomePage, 1, "v4", "+Auto Mobs\n+Melhorias na Otimizacao")
 
 --// ==========================================
 --// ABA COMBAT
@@ -1971,6 +1970,7 @@ startNoclip()
 --// ==========================================
 
 local OriginalStructures = {}
+local OriginalGraphics = settings().Rendering.QualityLevel
 local optimizationConnection = nil
 
 local setOtimizacao, getOtimizacao
@@ -2089,7 +2089,6 @@ local function hideStructures()
         processStructure(obj)
     end
 
-    -- Para jogos com StreamingEnabled: garante que estruturas que carregarem depois também sejam escondidas
     optimizationConnection = workspace.DescendantAdded:Connect(function(obj)
         task.wait(0.1)
         processStructure(obj)
@@ -2124,16 +2123,19 @@ end
 
 local optimizationLoading = false
 
-local function waitAndHide(stateChecker, notificationTitle)
+local function waitAndHide(stateChecker)
     if optimizationLoading then return end
     optimizationLoading = true
 
     task.spawn(function()
         pcall(function()
+            OriginalGraphics = settings().Rendering.QualityLevel
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level10
+            
             StarterGui:SetCore("SendNotification", {
-                Title = notificationTitle,
-                Text = "Carregando o mapa inteiro. Aguarde...",
-                Duration = 3,
+                Title = "Otimização",
+                Text = "Aumentando gráfico e carregando o mapa. Aguarde...",
+                Duration = 4,
             })
         end)
 
@@ -2158,6 +2160,12 @@ local function waitAndHide(stateChecker, notificationTitle)
         if optimizationLoading and stateChecker() then
             hideStructures()
         end
+
+        -- Restaura o gráfico original após esconder as estruturas
+        pcall(function()
+            settings().Rendering.QualityLevel = OriginalGraphics
+        end)
+
         optimizationLoading = false
     end)
 end
@@ -2169,10 +2177,13 @@ setOtimizacao, getOtimizacao = createToggleCard(
     false,
     function(state)
         if state then
-            waitAndHide(function() return getOtimizacao and getOtimizacao() end, "Otimização")
+            waitAndHide(function() return getOtimizacao and getOtimizacao() end)
         else
             optimizationLoading = false
             restoreStructures()
+            pcall(function()
+                settings().Rendering.QualityLevel = OriginalGraphics
+            end)
         end
     end
 )
@@ -2202,7 +2213,7 @@ local OptDescText = Instance.new("TextLabel")
 OptDescText.Size = UDim2.new(1, -32, 0, 45)
 OptDescText.Position = UDim2.new(0, 16, 0, 32)
 OptDescText.BackgroundTransparency = 1
-OptDescText.Text = "Oculta todas as estruturas do mapa para garantir uma otimização fluida e sem travamentos. Seu gráfico permanece intacto. Ao desativar, todas as estruturas são restauradas ao seu estado original."
+OptDescText.Text = "Aumenta o gráfico ao máximo para carregar o mapa inteiro e depois oculta todas as estruturas, garantindo fluidez e sem travamentos. Ao desativar, tudo volta ao normal."
 OptDescText.TextColor3 = Theme.TextDim
 OptDescText.Font = Enum.Font.Gotham
 OptDescText.TextSize = 12
@@ -2275,6 +2286,9 @@ local function destroyScript()
     restoreStructures()
     stopAntiAFK()
     stopNoclip()
+    pcall(function()
+        settings().Rendering.QualityLevel = OriginalGraphics
+    end)
 end
 
 _G.__RamdomHubStop = destroyScript
@@ -2321,7 +2335,7 @@ tween(Main, {Size = CONFIG.UISize, Position = CONFIG.UIOffset}, 0.35, Enum.Easin
 pcall(function()
     StarterGui:SetCore("SendNotification", {
         Title = "RAMDOM HUB v" .. CONFIG.Version,
-        Text = "Auto Click, Auto Skill e Auto Mob atualizados!",
+        Text = "+Auto Mobs | +Melhorias na Otimizacao",
         Duration = 5,
     })
 end)
