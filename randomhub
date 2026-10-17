@@ -1,13 +1,14 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v4                       ║
+    ║                 RAMDOM HUB  v4.1                     ║
     ║ Combat, Home, Auto Farm, Auto Minner, Otimização, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v4:
-      + Auto Minner ( Beta )
+    v4.1:
+      + Melhorias no Auto Miner
       - Otimização apaga estruturas aos poucos (anti-travamento).
       - Localizar Estruturas: mostra hitboxes num raio de 100 studs.
+      - Botão "Join Discord" na aba Home.
 ]]
 
 --// Serviços
@@ -21,6 +22,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local VirtualUser = game:GetService("VirtualUser")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
@@ -38,7 +40,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "4",
+    Version = "4.1",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -111,6 +113,8 @@ local MINER_CFG = {
     MineDistance = 4,            
     ReachBuffer = 4,             
     ClickDelay = 0.10,           
+    MaxClicksWithoutBreak = 5,   
+    FifthClickVerifyDelay = 2.25, 
     MineTimeout = 25,            
     TargetMaxTime = 90,          
     WalkTimeoutMin = 40,         
@@ -121,6 +125,14 @@ local MINER_CFG = {
     BlockRadius = 3,
     RescanDelay = 1.0,
     TickRate = 0.1,
+    NearbyScanRadius = 10,
+    TargetScanInterval = 1.75,
+    TargetSwitchMargin = 3,
+    WalkStopDistance = 2.5,
+    TypeDiscoveryInterval = 3,
+    CandidateCacheSeconds = 5,
+    CandidateScanYieldEvery = 250,
+    MoveToRefreshInterval = 0.8,
 
     HoldShiftWhileMoving = MOB_CFG.HoldShiftWhileMoving,
     Debug = false,               
@@ -1063,10 +1075,12 @@ do
     local PathfindingService = game:GetService("PathfindingService")
     local STEER_NAME = "RamdomHubAutoMinerSteer"
 
-    local rejected = setmetatable({}, { __mode = "k" })  
-    local blocked = {}                                    
+    local rejected = setmetatable({}, { __mode = "k" })
+    local blocked = {}
     local nameKindCache = {}
 
+    local candidateCache = nil
+    local candidateCacheAt = 0
     local aimTarget = nil
     local moving, keysDown = false, false
 
@@ -1162,16 +1176,48 @@ do
     end
 
     local ORE_PATTERNS = { "%f[%a]ores?%f[%A]" }
-    local CRYSTAL_PATTERNS = { "crystal", "cristal", "%f[%a]gems?", "gemstone", "mineral", "geode" }
+    local CRYSTAL_PATTERNS = { "crystals?", "cristais?", "%f[%a]gems?%f[%A]", "gemstone", "minerals?", "geodes?", "veins?", "deposits?", "nodes?", "fragments?", "shards?", "chunks?" }
+    local RESOURCE_CONTEXT_PATTERNS = { "%f[%a]ores?%f[%A]", "crystals?", "cristais?", "%f[%a]gems?%f[%A]", "gemstone", "minerals?", "geodes?", "veins?", "deposits?", "nodes?", "fragments?", "shards?", "chunks?" }
     local BLOCKED_WORDS = {
         "shop", "store", "sell", "npc", "quest", "vendor", "merchant",
         "forge", "furnace", "smelt", "chest", "crate", "cart", "portal", "sign",
+        "sword", "weapon", "pickaxe", "axe", "armor", "helmet", "tool", "coin",
+        "ingot", "statue", "decoration", "building", "platform", "wall", "door", "gate",
+        "pillar", "pilar", "column", "coluna",
+    }
+
+    local PILLAR_PATTERNS = {
+        "%f[%a]pillars?%f[%A]", "%f[%a]pilar%f[%A]", "%f[%a]pilares%f[%A]",
+        "%f[%a]columns?%f[%A]", "%f[%a]coluna%f[%A]", "%f[%a]colunas%f[%A]",
+    }
+
+    local KNOWN_ORE_TYPES = {
+        { Label = "Iron", Names = { "iron", "ferro" } },
+        { Label = "Diamond", Names = { "diamond", "diamante" } },
+        { Label = "Gold", Names = { "gold", "ouro" } },
+        { Label = "Copper", Names = { "copper", "cobre" } },
+        { Label = "Silver", Names = { "silver", "prata" } },
+        { Label = "Coal", Names = { "coal", "carvao", "carvão" } },
+        { Label = "Emerald", Names = { "emerald", "esmeralda" } },
+        { Label = "Ruby", Names = { "ruby", "rubi" } },
+        { Label = "Sapphire", Names = { "sapphire", "safira" } },
+        { Label = "Amethyst", Names = { "amethyst", "ametista" } },
+        { Label = "Quartz", Names = { "quartz", "quartzo" } },
+        { Label = "Obsidian", Names = { "obsidian", "obsidiana" } },
+        { Label = "Tin", Names = { "tin", "estanho" } },
+        { Label = "Cobalt", Names = { "cobalt", "cobalto" } },
+        { Label = "Mithril", Names = { "mithril", "mithril ore" } },
+        { Label = "Platinum", Names = { "platinum", "platina" } },
+        { Label = "Uranium", Names = { "uranium", "uranio", "urânio" } },
+        { Label = "Titanium", Names = { "titanium", "titanio", "titânio" } },
+        { Label = "Nickel", Names = { "nickel", "niquel", "níquel" } },
     }
 
     local function normalizeName(name)
         local s = tostring(name or "")
-        s = s:gsub("(%l)(%u)", "%1 %2")   
-        s = s:gsub("[_%-%.]+", " ")
+        s = s:gsub("(%l)(%u)", "%1 %2")
+        s = s:gsub("[_%-%\.]+", " ")
+        s = s:gsub("%s+", " ")
         return string.lower(s)
     end
 
@@ -1182,13 +1228,70 @@ do
         return false
     end
 
+    local function titleCase(s)
+        s = tostring(s or ""):gsub("%s+", " "):match("^%s*(.-)%s*$") or ""
+        return (s:gsub("%S+", function(word)
+            return word:sub(1, 1):upper() .. word:sub(2)
+        end))
+    end
+
+    local function knownOreTypeFromText(text)
+        local s = normalizeName(text)
+        for _, entry in ipairs(KNOWN_ORE_TYPES) do
+            for _, alias in ipairs(entry.Names) do
+                local a = normalizeName(alias)
+                if s == a or s:find(" " .. a .. " ", 1, true)
+                    or s:sub(1, #a + 1) == a .. " "
+                    or s:sub(-#a - 1) == " " .. a then
+                    return entry.Label
+                end
+            end
+        end
+        return nil
+    end
+
+    local function genericOreTypeFromText(text, fallback)
+        local s = normalizeName(text)
+        local cleaned = s
+        for _, pattern in ipairs({
+            "%f[%a]ores?%f[%A]", "crystals?", "cristais?", "%f[%a]gems?%f[%A]",
+            "gemstone", "minerals?", "geodes?", "veins?", "deposits?", "nodes?",
+            "fragments?", "shards?", "chunks?", "large", "small", "ancient", "rich",
+        }) do
+            cleaned = cleaned:gsub(pattern, " ")
+        end
+        cleaned = cleaned:gsub("%d+", " "):gsub("[%p_]+", " "):gsub("%s+", " ")
+        cleaned = cleaned:match("^%s*(.-)%s*$") or ""
+        if cleaned ~= "" then return titleCase(cleaned) end
+        return fallback or "Other Ores"
+    end
+
+    local function attributesSuggestOre(inst)
+        if not inst then return false end
+        local ok, attrs = pcall(function() return inst:GetAttributes() end)
+        if not ok or type(attrs) ~= "table" then return false end
+        for key, value in pairs(attrs) do
+            local k = normalizeName(key)
+            local compactKey = k:gsub("%s+", "")
+            if k:find("ore", 1, true) or k:find("resource", 1, true)
+                or k:find("mineral", 1, true) or k:find("crystal", 1, true)
+                or k:find("mineable", 1, true) or k:find("mining", 1, true) then
+                if value == true then return true end
+                if type(value) == "string" and value ~= "" then return true end
+            elseif (compactKey == "resourcetype" or compactKey == "nodetype" or compactKey == "materialtype")
+                and type(value) == "string" and knownOreTypeFromText(value) then
+                return true
+            end
+        end
+        return false
+    end
+
     local function nameKind(name)
         local cached = nameKindCache[name]
         if cached ~= nil then return cached end
 
         local s = normalizeName(name)
         local kind = false
-
         local isBlockedName = false
         for _, w in ipairs(BLOCKED_WORDS) do
             if s:find(w, 1, true) then
@@ -1198,10 +1301,11 @@ do
         end
 
         if not isBlockedName then
-            if matchesAny(s, ORE_PATTERNS) then
+            local known = knownOreTypeFromText(s)
+            local hasResourceContext = matchesAny(s, RESOURCE_CONTEXT_PATTERNS)
+            local bareKnownType = known ~= nil and s == string.lower(known)
+            if matchesAny(s, ORE_PATTERNS) or hasResourceContext or bareKnownType then
                 kind = "ore"
-            elseif matchesAny(s, CRYSTAL_PATTERNS) then
-                kind = "crystal"
             else
                 for _, h in ipairs(MINER_CFG.ExtraNameHints) do
                     if h ~= "" and s:find(string.lower(h), 1, true) then
@@ -1216,15 +1320,18 @@ do
         return kind
     end
 
-    local function isOreItemName(name)
-        local s = normalizeName(name)
-        if matchesAny(s, ORE_PATTERNS) then return true end
-        for _, h in ipairs(MINER_CFG.ExtraNameHints) do
-            if h ~= "" and s:find(string.lower(h), 1, true) then return true end
+    local function isOreItemName(name, allowBareType)
+        local normalized = normalizeName(name)
+        normalized = normalized:gsub("%s*[xX]%s*%d+%s*$", "")
+            :gsub("%s*%(%d+%)%s*$", "")
+            :gsub("^%d+%s*[xX]%s*", "")
+            :match("^%s*(.-)%s*$") or normalized
+        local known = knownOreTypeFromText(normalized)
+        if known and normalized == string.lower(known) and not allowBareType then
+            return false
         end
-        return false
+        return nameKind(normalized) ~= false
     end
-
     local CRYSTAL_MATERIALS = {
         [Enum.Material.Neon] = true,
         [Enum.Material.Glass] = true,
@@ -1250,17 +1357,105 @@ do
         return false
     end
 
+    local function getOreType(inst, kind)
+        if not inst then return "Other Ores" end
+        local names = {}
+        local cur = inst
+        local depth = 0
+        while cur and cur ~= workspace and depth < 5 do
+            table.insert(names, cur.Name)
+            cur = cur.Parent
+            depth = depth + 1
+        end
+
+        for _, name in ipairs(names) do
+            local known = knownOreTypeFromText(name)
+            if known then return known end
+        end
+
+        cur = inst
+        depth = 0
+        while cur and cur ~= workspace and depth < 4 do
+            local ok, attrs = pcall(function() return cur:GetAttributes() end)
+            if ok and type(attrs) == "table" then
+                for key, value in pairs(attrs) do
+                    local k = normalizeName(key)
+                    local compactKey = k:gsub("%s+", "")
+                    local relevant = k:find("ore", 1, true) or k:find("resource", 1, true)
+                        or k:find("mineral", 1, true) or k:find("crystal", 1, true)
+                        or k:find("mineable", 1, true) or k:find("mining", 1, true)
+                        or compactKey == "resourcetype" or compactKey == "nodetype" or compactKey == "materialtype"
+                    if relevant and type(value) == "string" and value ~= "" then
+                        local known = knownOreTypeFromText(value)
+                        if known then return known end
+                        if matchesAny(normalizeName(value), RESOURCE_CONTEXT_PATTERNS) then
+                            return genericOreTypeFromText(value, "Other Ores")
+                        end
+                        if relevant and (compactKey ~= "materialtype" or kind == "ore" or (kind and kind:find("ore", 1, true))) then
+                            return titleCase(value)
+                        end
+                    end
+                end
+            end
+            cur = cur.Parent
+            depth = depth + 1
+        end
+
+        for _, name in ipairs(names) do
+            local normalized = normalizeName(name)
+            if matchesAny(normalized, ORE_PATTERNS) or matchesAny(normalized, RESOURCE_CONTEXT_PATTERNS) then
+                return genericOreTypeFromText(name, (kind and kind:find("crystal", 1, true)) and "Other Crystals" or "Other Ores")
+            end
+        end
+        if kind and kind:find("crystal", 1, true) then return "Other Crystals" end
+        if kind == "aparencia" then return "Other Crystals" end
+        return "Other Ores"
+    end
+
+    local function isPillarStructure(inst)
+        local cur = inst
+        local depth = 0
+        while cur and cur ~= workspace and depth < 7 do
+            local normalized = normalizeName(cur.Name)
+            if matchesAny(normalized, PILLAR_PATTERNS) then
+                return true
+            end
+
+            local ok, attrs = pcall(function() return cur:GetAttributes() end)
+            if ok and type(attrs) == "table" then
+                for key, value in pairs(attrs) do
+                    local compactKey = normalizeName(key):gsub("%s+", "")
+                    if value == true and (compactKey == "ispillar" or compactKey == "iscolumn"
+                        or compactKey == "isstructuralpillar") then
+                        return true
+                    end
+                    if type(value) == "string" and (compactKey == "structuretype"
+                        or compactKey == "objecttype" or compactKey == "parttype" or compactKey == "type")
+                        and matchesAny(normalizeName(value), PILLAR_PATTERNS) then
+                        return true
+                    end
+                end
+            end
+            cur = cur.Parent
+            depth = depth + 1
+        end
+        return false
+    end
+
     local function classify(d)
         local isModel = d:IsA("Model")
         local isPart = (not isModel) and d:IsA("BasePart") and not d:IsA("Terrain")
         if not (isModel or isPart) then return nil end
+        if isPillarStructure(d) then return nil end
 
         local kind = nameKind(d.Name)
+        if not kind and attributesSuggestOre(d) then kind = "ore" end
 
         if not kind then
             local parent = d.Parent
             if parent and parent ~= workspace then
                 local pk = nameKind(parent.Name)
+                if not pk and attributesSuggestOre(parent) then pk = "ore" end
                 if pk and isContainer(parent) then
                     kind = "pasta:" .. pk
                 end
@@ -1278,33 +1473,46 @@ do
         return kind
     end
 
-    local function partLooksOre(p)
-        if nameKind(p.Name) then return true end
-        local par = p.Parent
-        if par and par ~= workspace and nameKind(par.Name) then return true end
-        return looksLikeCrystal(p)
-    end
-
-    local function collectCandidates(root)
-        local rp = root.Position
-        local radius = MINER_CFG.SearchRadius
+    local function rebuildCandidateCache(token)
         local found, set = {}, {}
+        local stack = { workspace }
+        local visited = 0
+        local yieldEvery = math.max(100, tonumber(MINER_CFG.CandidateScanYieldEvery) or 250)
 
-        for _, d in ipairs(workspace:GetDescendants()) do
-            local kind = classify(d)
-            if kind then
-                local okPivot, pivot = pcall(function() return d:GetPivot().Position end)
-                if okPivot and pivot then
-                    local dist = (pivot - rp).Magnitude
-                    if dist <= radius then
-                        table.insert(found, { Inst = d, Pos = pivot, Dist = dist, Kind = kind })
-                        set[d] = true
-                    end
+        while #stack > 0 do
+            if token and not isActive(token) then
+                return false
+            end
+
+            local current = table.remove(stack)
+            if current ~= workspace then
+                local kind = classify(current)
+                if kind then
+                    table.insert(found, {
+                        Inst = current,
+                        Kind = kind,
+                        OreType = getOreType(current, kind),
+                    })
+                    set[current] = true
                 end
+            end
+
+            local okChildren, children = pcall(function()
+                return current:GetChildren()
+            end)
+            if okChildren and children then
+                for _, child in ipairs(children) do
+                    table.insert(stack, child)
+                end
+            end
+
+            visited = visited + 1
+            if visited % yieldEvery == 0 then
+                task.wait()
             end
         end
 
-        local list = {}
+        local roots = {}
         for _, c in ipairs(found) do
             local nested = false
             local anc = c.Inst.Parent
@@ -1316,7 +1524,60 @@ do
                 anc = anc.Parent
             end
             if not nested then
-                table.insert(list, c)
+                table.insert(roots, c)
+            end
+        end
+
+        candidateCache = roots
+        candidateCacheAt = os.clock()
+        return true
+    end
+
+    local function getCandidatePosition(inst)
+        if not inst or not inst.Parent then return nil end
+        local ok, pos = pcall(function()
+            if inst:IsA("BasePart") then
+                return inst.Position
+            end
+            return inst:GetBoundingBox().Position
+        end)
+        if ok and pos then return pos end
+        ok, pos = pcall(function() return inst:GetPivot().Position end)
+        if ok then return pos end
+        return nil
+    end
+
+    local function collectCandidates(root, token)
+        if not candidateCache or (os.clock() - candidateCacheAt) >= MINER_CFG.CandidateCacheSeconds then
+            if not rebuildCandidateCache(token) then
+                return {}
+            end
+        end
+
+        local rp = root.Position
+        local radius = MINER_CFG.SearchRadius
+        local list = {}
+        for _, cached in ipairs(candidateCache or {}) do
+            local inst = cached.Inst
+            if inst and inst.Parent then
+                local okInWorkspace, inWorkspace = pcall(function()
+                    return inst:IsDescendantOf(workspace)
+                end)
+                if okInWorkspace and inWorkspace then
+                    local pivot = getCandidatePosition(inst)
+                    if pivot then
+                        local dist = (pivot - rp).Magnitude
+                        if dist <= radius then
+                            table.insert(list, {
+                                Inst = inst,
+                                Pos = pivot,
+                                Dist = dist,
+                                Kind = cached.Kind,
+                                OreType = cached.OreType,
+                            })
+                        end
+                    end
+                end
             end
         end
 
@@ -1419,36 +1680,51 @@ do
         return true, groundPos, supports
     end
 
-    local function isEmbedded(inst, center, mn, mx, supports)
-        local ext = mx - mn
-        local size = Vector3.new(
-            math.max(ext.X * 0.5, 0.4),
-            math.max(ext.Y * 0.5, 0.4),
-            math.max(ext.Z * 0.5, 0.4)
-        )
+    local function findGroundBelow(inst, center, ext, fromPosition)
+        local char = player.Character
+        local reference = fromPosition or center
+        local startY = math.min(center.Y + 1, reference.Y + 6)
+        local offset = math.clamp(math.max(ext.X, ext.Z) * 0.5 + 2, 2, 10)
+        local offsets = {
+            Vector3.new(0, 0, 0),
+            Vector3.new(offset, 0, 0),
+            Vector3.new(-offset, 0, 0),
+            Vector3.new(0, 0, offset),
+            Vector3.new(0, 0, -offset),
+        }
 
-        local params = OverlapParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        local ignore = { inst }
-        if player.Character then table.insert(ignore, player.Character) end
-        params.FilterDescendantsInstances = ignore
-        pcall(function() params.RespectCanCollide = true end)
+        local bestPosition, bestScore = nil, math.huge
+        for _, o in ipairs(offsets) do
+            local ignore = { inst }
+            if char then table.insert(ignore, char) end
+            local origin = Vector3.new(center.X + o.X, startY, center.Z + o.Z)
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.FilterDescendantsInstances = ignore
+            params.IgnoreWater = true
+            pcall(function() params.RespectCanCollide = true end)
 
-        local okQ, parts = pcall(function()
-            return workspace:GetPartBoundsInBox(CFrame.new(center), size, params)
-        end)
-        if not okQ or not parts then return false end
+            for _ = 1, 4 do
+                params.FilterDescendantsInstances = ignore
+                local okRay, hit = pcall(function()
+                    return workspace:Raycast(origin, Vector3.new(0, -600, 0), params)
+                end)
+                if not okRay or not hit then break end
 
-        local limitY = center.Y + (ext.Y / 2) * MINER_CFG.EmbedTopFactor
-        for _, p in ipairs(parts) do
-            if not p:IsA("Terrain") and not supports[p] and not livingAncestor(p) and not partLooksOre(p) then
-                local _, pmx = worldBounds(p.CFrame, p.Size)
-                if pmx.Y > limitY then
-                    return true
+                if hit.Normal.Y >= 0.45 then
+                    local pos = hit.Position
+                    local score = (pos - reference).Magnitude + horizontal(pos, center) * 0.2
+                    if score < bestScore then
+                        bestScore, bestPosition = score, pos
+                    end
+                    break
                 end
+
+                if hit.Instance == workspace.Terrain then break end
+                table.insert(ignore, hit.Instance)
             end
         end
-        return false
+        return bestPosition
     end
 
     local function evaluate(inst)
@@ -1462,33 +1738,42 @@ do
         if biggest > MINER_CFG.MaxOreSize then return nil, "grande-demais" end
 
         local center = (mn + mx) / 2
+        local _, _, playerRoot = getChar()
+        local reference = playerRoot and playerRoot.Position or center
 
-        local good, groundPos, supports = checkGround(inst, mn, mx, center)
-        if not good then return nil, "sem-apoio-no-chao (parede/alto)" end
-
-        if isEmbedded(inst, center, mn, mx, supports) then
-            return nil, "embutido-em-parede/plataforma"
+        local good, groundPos = checkGround(inst, mn, mx, center)
+        if not good then
+            groundPos = findGroundBelow(inst, center, ext, reference)
+        end
+        if not groundPos then
+            groundPos = Vector3.new(center.X, reference.Y, center.Z)
         end
 
         local parts = collectParts(inst)
-        local visible = false
+        local visibleCount = 0
+        local initialTransparency = {}
         for _, p in ipairs(parts) do
-            if p.Transparency < 0.95 then
-                visible = true
-                break
+            initialTransparency[p] = p.Transparency
+            if p.Transparency < 0.98 then
+                visibleCount = visibleCount + 1
             end
         end
 
         return {
             Inst = inst,
             Name = inst.Name,
+            OreType = getOreType(inst, nameKind(inst.Name)),
             Center = center,
             Top = mx.Y,
             Bottom = mn.Y,
             Radius = math.clamp(math.max(ext.X, ext.Z) / 2, 1, 8),
+            InitialSize = ext,
+            InitialPartCount = #parts,
+            InitialVisibleCount = visibleCount,
+            InitialTransparency = initialTransparency,
             GroundPos = groundPos,
             Parts = parts,
-            WasVisible = visible,
+            WasVisible = visibleCount > 0,
             StandPoint = nil,
             Waypoints = nil,
         }
@@ -1496,19 +1781,24 @@ do
 
     local function computeStandPoint(info, from)
         local flat = Vector3.new(from.X - info.Center.X, 0, from.Z - info.Center.Z)
-        local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(1, 0, 0)
-        local offset = info.Radius + MINER_CFG.MineDistance * 0.5
+        local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 0)
+        local offset = flat.Magnitude > 0.1 and ((info.Radius or 1) + MINER_CFG.MineDistance * 0.5) or 0
         local px = info.Center.X + dir.X * offset
         local pz = info.Center.Z + dir.Z * offset
+        local groundY = info.GroundPos and info.GroundPos.Y or from.Y
 
         local ignore = { info.Inst }
         if player.Character then table.insert(ignore, player.Character) end
-
-        local res = castRay(Vector3.new(px, info.GroundPos.Y + 6, pz), Vector3.new(0, -20, 0), ignore)
-        if res and res.Normal.Y >= MINER_CFG.MinGroundNormalY and math.abs(res.Position.Y - info.GroundPos.Y) <= 6 then
+        local res = castRay(
+            Vector3.new(px, groundY + 8, pz),
+            Vector3.new(0, -80, 0),
+            ignore
+        )
+        if res and res.Normal.Y >= 0.45 then
             return res.Position
         end
-        return info.GroundPos
+
+        return Vector3.new(px, groundY, pz)
     end
 
     local function computePath(fromPos, toPos)
@@ -1551,12 +1841,16 @@ do
         info.StandPoint = stand
 
         local ok, wps = computePath(root.Position, stand)
-        if not ok then return false end
+        if not ok then
+            info.Waypoints = nil
+            return true
+        end
 
         if wps then
             local last = wps[#wps].Position
             if horizontal(last, stand) > 8 or math.abs(last.Y - stand.Y) > 8 then
-                return false
+                info.Waypoints = nil
+                return true
             end
         end
 
@@ -1573,7 +1867,7 @@ do
             local b = blocked[i]
             if b.Until <= now then
                 table.remove(blocked, i)
-            elseif horizontal(b.Pos, pos) <= MINER_CFG.BlockRadius then
+            elseif (b.Pos - pos).Magnitude <= MINER_CFG.BlockRadius then
                 return true
             end
         end
@@ -1582,7 +1876,7 @@ do
 
     local function pickTarget(root, token)
         local now = os.clock()
-        local cands = collectCandidates(root)
+        local cands = collectCandidates(root, token)
         local stats = { Total = #cands, Ground = 0, Rejected = 0, Blocked = 0, PathTries = 0 }
 
         for _, c in ipairs(cands) do
@@ -1590,7 +1884,6 @@ do
 
             local inst = c.Inst
             local untilT = rejected[inst]
-
             if untilT and untilT > now then
                 stats.Rejected = stats.Rejected + 1
             elseif isBlocked(c.Pos, now) then
@@ -1602,18 +1895,12 @@ do
                     stats.Rejected = stats.Rejected + 1
                     dbg(inst:GetFullName(), "[" .. tostring(c.Kind) .. "] descartado:", reason)
                 else
+                    info.OreType = c.OreType or getOreType(inst, c.Kind)
                     stats.Ground = stats.Ground + 1
-                    if stats.PathTries < MINER_CFG.MaxPathChecks then
-                        stats.PathTries = stats.PathTries + 1
-                        if checkReachable(info, root) then
-                            dbg(inst:GetFullName(), "[" .. tostring(c.Kind) .. "] aceito")
-                            return info, stats
-                        end
-                        rejected[inst] = os.clock() + MINER_CFG.IgnoreTime
-                        stats.Rejected = stats.Rejected + 1
-                        dbg(inst:GetFullName(), "[" .. tostring(c.Kind) .. "] descartado: sem caminho a pé")
-                    else
-                        break
+                    stats.PathTries = stats.PathTries + 1
+                    if checkReachable(info, root) then
+                        dbg(inst:GetFullName(), "[" .. tostring(c.Kind) .. "] alvo mais próximo aceito")
+                        return info, stats
                     end
                 end
             end
@@ -1622,23 +1909,176 @@ do
         return nil, stats
     end
 
+    local function findNearbyBetterTarget(root, currentInfo, token)
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = player.Character and { player.Character } or {}
+        pcall(function() params.MaxParts = 180 end)
+        local okQuery, parts = pcall(function()
+            return workspace:GetPartBoundsInRadius(root.Position, MINER_CFG.NearbyScanRadius, params)
+        end)
+        if not okQuery or not parts then return nil end
+
+        local seen, candidates = {}, {}
+        for _, part in ipairs(parts) do
+            local cur = part
+            local chosen = nil
+            local depth = 0
+            while cur and cur ~= workspace and depth < 6 do
+                if cur:IsA("Model") or cur:IsA("BasePart") then
+                    local kind = classify(cur)
+                    if kind then chosen = { Inst = cur, Kind = kind } end
+                end
+                cur = cur.Parent
+                depth = depth + 1
+            end
+            local relatedToCurrent = false
+            if chosen and chosen.Inst then
+                pcall(function()
+                    relatedToCurrent = chosen.Inst == currentInfo.Inst
+                        or chosen.Inst:IsDescendantOf(currentInfo.Inst)
+                        or currentInfo.Inst:IsDescendantOf(chosen.Inst)
+                end)
+            end
+            if chosen and chosen.Inst and not relatedToCurrent and not seen[chosen.Inst] then
+                seen[chosen.Inst] = true
+                local oreType = getOreType(chosen.Inst, chosen.Kind)
+                local ignoredUntil = rejected[chosen.Inst]
+                if not ignoredUntil or ignoredUntil <= os.clock() then
+                    local posOK, pos = pcall(function()
+                        if chosen.Inst:IsA("BasePart") then return chosen.Inst.Position end
+                        local cf = chosen.Inst:GetBoundingBox()
+                        return cf.Position
+                    end)
+                    if posOK and pos and not isBlocked(pos, os.clock()) then
+                        table.insert(candidates, { Inst = chosen.Inst, Kind = chosen.Kind, OreType = oreType, Pos = pos, Dist = (pos - root.Position).Magnitude })
+                    end
+                end
+            end
+        end
+        table.sort(candidates, function(a, b) return a.Dist < b.Dist end)
+
+        local currentDist = (root.Position - currentInfo.Center).Magnitude
+        local evaluated = 0
+        for _, candidate in ipairs(candidates) do
+            if not isActive(token) then return nil end
+            if candidate.Dist + MINER_CFG.TargetSwitchMargin < currentDist then
+                local info = evaluate(candidate.Inst)
+                evaluated = evaluated + 1
+                if info then
+                    info.OreType = candidate.OreType
+                    info.StandPoint = computeStandPoint(info, root.Position)
+                    info.Waypoints = nil
+                    dbg("alvo próximo encontrado:", info.Name, "[" .. tostring(info.OreType) .. "]")
+                    return info
+                end
+                if evaluated >= 3 then break end
+            else
+                break
+            end
+        end
+        return nil
+    end
+
+    local function hasDepletedFlag(inst)
+        if not inst then return false end
+        local objects = { inst }
+        for _, d in ipairs(inst:GetDescendants()) do
+            table.insert(objects, d)
+            if #objects >= 80 then break end
+        end
+
+        local depletedNames = {
+            destroyed = true, isdestroyed = true, collected = true, iscollected = true,
+            mined = true, ismined = true, depleted = true, isdepleted = true,
+            broken = true, isbroken = true,
+        }
+        for _, obj in ipairs(objects) do
+            local ok, attrs = pcall(function() return obj:GetAttributes() end)
+            if ok and type(attrs) == "table" then
+                for key, value in pairs(attrs) do
+                    local compactKey = normalizeName(key):gsub("%s+", "")
+                    if depletedNames[compactKey] and value == true then
+                        return true
+                    end
+                    if (compactKey == "health" or compactKey == "hp" or compactKey == "hitpoints"
+                        or compactKey == "durability") and type(value) == "number" and value <= 0 then
+                        return true
+                    end
+                end
+            end
+
+            local compactName = normalizeName(obj.Name):gsub("%s+", "")
+            if obj:IsA("BoolValue") and depletedNames[compactName] and obj.Value then
+                return true
+            end
+            if (obj:IsA("IntValue") or obj:IsA("NumberValue"))
+                and (compactName == "health" or compactName == "hp" or compactName == "hitpoints"
+                    or compactName == "durability") and obj.Value <= 0 then
+                return true
+            end
+        end
+        return false
+    end
+
     local function oreGone(info)
         local inst = info.Inst
         if not inst or not inst.Parent or not inst:IsDescendantOf(workspace) then
             return true, "sumiu"
         end
 
-        if info.WasVisible then
-            local anyVisible = false
-            for _, p in ipairs(info.Parts) do
-                if p.Parent and p.Transparency < 0.95 then
-                    anyVisible = true
-                    break
+        if hasDepletedFlag(inst) then
+            return true, "estado destruído confirmado"
+        end
+
+        local currentParts = collectParts(inst)
+        local currentCount, visibleCount = 0, 0
+        for _, part in ipairs(currentParts) do
+            if part.Parent and (part == inst or part:IsDescendantOf(inst)) then
+                currentCount = currentCount + 1
+                if part.Transparency < 0.98 then
+                    visibleCount = visibleCount + 1
                 end
             end
-            if not anyVisible then
-                return true, "oculto"
+        end
+
+        local initialCount = info.InitialPartCount or #(info.Parts or {})
+        local initialVisible = info.InitialVisibleCount or (info.WasVisible and 1 or 0)
+        if initialCount > 0 and currentCount == 0 then
+            return true, "partes do cristal removidas"
+        end
+
+        if info.WasVisible and visibleCount == 0 then
+            local originalPartsRemaining = 0
+            for _, part in ipairs(info.Parts or {}) do
+                if part.Parent and (part == inst or part:IsDescendantOf(inst)) then
+                    originalPartsRemaining = originalPartsRemaining + 1
+                end
             end
+
+            local substantialRemoval = initialCount > 0
+                and originalPartsRemaining <= math.max(0, math.floor(initialCount * 0.25))
+            local now = os.clock()
+            info.HiddenSince = info.HiddenSince or now
+            local hiddenFor = now - info.HiddenSince
+            if substantialRemoval and hiddenFor >= 0.55 then
+                return true, "maioria das partes removida"
+            end
+            if hiddenFor >= 1.6 and (currentCount == 0 or originalVisible > 0) then
+                return true, "cristal permaneceu invisível"
+            end
+        else
+            info.HiddenSince = nil
+        end
+
+        if initialCount >= 3 and currentCount <= math.max(1, math.floor(initialCount * 0.2))
+            and visibleCount <= math.max(1, math.floor((initialVisible or 1) * 0.2)) then
+            info.BrokenShapeSince = info.BrokenShapeSince or os.clock()
+            if os.clock() - info.BrokenShapeSince >= 0.6 then
+                return true, "estrutura do cristal desmontada"
+            end
+        else
+            info.BrokenShapeSince = nil
         end
 
         return false
@@ -1665,7 +2105,7 @@ do
         local function scanTools(container)
             if not container then return end
             for _, c in ipairs(container:GetChildren()) do
-                if c:IsA("Tool") and isOreItemName(c.Name) then
+                if c:IsA("Tool") and isOreItemName(c.Name, true) then
                     add(baseName(c.Name), stackCount(c.Name))
                 end
             end
@@ -1677,7 +2117,7 @@ do
         for _, child in ipairs(player:GetChildren()) do
             if child.Name ~= "PlayerGui" and child.Name ~= "PlayerScripts" and not child:IsA("Backpack") then
                 for _, d in ipairs(child:GetDescendants()) do
-                    if (d:IsA("IntValue") or d:IsA("NumberValue")) and isOreItemName(d.Name) then
+                    if (d:IsA("IntValue") or d:IsA("NumberValue")) and isOreItemName(d.Name, false) then
                         add("valor:" .. d:GetFullName(), d.Value)
                     end
                 end
@@ -1687,10 +2127,60 @@ do
         return { Total = total, ByName = byName }
     end
 
-    local function inventoryIncreased(before, after)
-        if after.Total > before.Total then return true end
+    local function hasWholePhrase(text, phrase)
+        local haystack = " " .. normalizeName(text) .. " "
+        local needle = " " .. normalizeName(phrase) .. " "
+        return phrase ~= nil and phrase ~= "" and haystack:find(needle, 1, true) ~= nil
+    end
+
+    local function inventoryKeyMatchesTarget(key, info)
+        local text = tostring(key or "")
+        text = text:gsub("^valor:", "")
+        local normalized = normalizeName(text)
+        local targetType = normalizeName(info.OreType or "")
+        local genericTarget = targetType == "other ores" or targetType == "other crystals"
+            or targetType == "other ore" or targetType == ""
+
+        if not genericTarget then
+            local itemType = knownOreTypeFromText(normalized)
+            if itemType and normalizeName(itemType) == targetType then
+                return true
+            end
+            if hasWholePhrase(normalized, targetType) then
+                return true
+            end
+        end
+
+        local targetName = normalizeName(info.Name or "")
+        if #targetName >= 4 and hasWholePhrase(normalized, targetName) then
+            return true
+        end
+        local nameType = knownOreTypeFromText(targetName)
+        local itemType = knownOreTypeFromText(normalized)
+        if nameType and itemType == nameType then
+            return true
+        end
+        return false
+    end
+
+    local function inventoryIncreased(before, after, info)
+        local changedKeys = {}
         for k, v in pairs(after.ByName) do
             if v > (before.ByName[k] or 0) then
+                table.insert(changedKeys, k)
+                if inventoryKeyMatchesTarget(k, info) then
+                    return true
+                end
+            end
+        end
+
+        local targetType = normalizeName(info.OreType or "")
+        local genericTarget = targetType == "other ores" or targetType == "other crystals"
+            or targetType == "other ore" or targetType == ""
+        if genericTarget and #changedKeys == 1 then
+            local changed = normalizeName(changedKeys[1]:gsub("^valor:", ""))
+            if changed:find("ore", 1, true) or changed:find("crystal", 1, true)
+                or changed:find("mineral", 1, true) or changed:find("gem", 1, true) then
                 return true
             end
         end
@@ -1706,8 +2196,10 @@ do
         local cf = cam.CFrame
         local dir = t - cf.Position
         if dir.Magnitude < 0.5 then return end
-        if math.abs(dir.Unit.Y) > 0.98 then return end
-        cam.CFrame = CFrame.lookAt(cf.Position, t)
+        local unitDir = dir.Unit
+        if cf.LookVector:Dot(unitDir) > 0.9995 then return end
+        local up = math.abs(unitDir.Y) > 0.98 and Vector3.new(0, 0, -1) or Vector3.new(0, 1, 0)
+        cam.CFrame = CFrame.lookAt(cf.Position, t, up)
     end
 
     local function faceTo(root, pos)
@@ -1724,7 +2216,7 @@ do
     end
 
     local function walkTo(info, token)
-        local reach = info.Radius + MINER_CFG.MineDistance
+        local reach = (info.Radius or 1) + MINER_CFG.MineDistance
         local waypoints = info.Waypoints
         local idx = 1
 
@@ -1735,6 +2227,8 @@ do
 
         local lastCheck, lastPos, stuck = t0, nil, 0
         local recomputes = 0
+        local lastNearbyScan = t0
+        local lastMoveTarget, lastMoveAt = nil, 0
         local result = "parou"
 
         while isActive(token) do
@@ -1754,10 +2248,22 @@ do
                 local now = os.clock()
                 local flat = horizontal(root.Position, info.Center)
                 local vert = math.abs(root.Position.Y - info.Center.Y)
+                local stand = info.StandPoint or info.GroundPos or info.Center
+                local standFlat = horizontal(root.Position, stand)
+                local standVert = math.abs(root.Position.Y - stand.Y)
 
-                if flat <= reach and vert <= MINER_CFG.MaxVerticalReach then
+                if standFlat <= MINER_CFG.WalkStopDistance and standVert <= MINER_CFG.MaxVerticalReach then
                     result = "arrived"
                     break
+                end
+
+                if now - lastNearbyScan >= MINER_CFG.TargetScanInterval then
+                    lastNearbyScan = now
+                    local better = findNearbyBetterTarget(root, info, token)
+                    if better then
+                        result = "retarget"
+                        return result, better
+                    end
                 end
 
                 if now - t0 > limit then
@@ -1782,10 +2288,15 @@ do
                         hum.Jump = true
                     end
                     if idx >= #waypoints and horizontal(root.Position, wp.Position) < 3.5 then
-                        target = info.Center
+                        target = info.StandPoint or info.Center
                     end
                 end
-                hum:MoveTo(target)
+                local targetChanged = not lastMoveTarget or (target - lastMoveTarget).Magnitude > 1.25
+                if targetChanged or (now - lastMoveAt) >= MINER_CFG.MoveToRefreshInterval then
+                    hum:MoveTo(target)
+                    lastMoveTarget = target
+                    lastMoveAt = now
+                end
 
                 if now - lastCheck >= 0.5 then
                     if lastPos and (root.Position - lastPos).Magnitude < 1 then
@@ -1803,16 +2314,13 @@ do
                 if stuck > 2.5 then
                     stuck = 0
                     recomputes = recomputes + 1
+                    local okPath, newWps = computePath(root.Position, info.StandPoint or info.Center)
+                    waypoints = okPath and newWps or nil
+                    idx = 1
                     if recomputes > 3 then
                         result = "inalcancavel"
                         break
                     end
-                    local okPath, newWps = computePath(root.Position, info.StandPoint or info.Center)
-                    if not okPath then
-                        result = "inalcancavel"
-                        break
-                    end
-                    waypoints, idx = newWps, 1
                 end
 
                 task.wait(MINER_CFG.TickRate)
@@ -1825,11 +2333,13 @@ do
     local function mineLoop(info, token)
         setMoving(false)
 
-        local reach = info.Radius + MINER_CFG.MineDistance
+        local reach = (info.Radius or 1) + MINER_CFG.MineDistance
         local t0 = os.clock()
         local invBefore = snapshotInventory()
         local lastInvCheck = 0
         local result, why = "parou", nil
+        local clickAttempts = 0
+        local verifyBreakUntil = nil
 
         while isActive(token) do
             local _, hum, root = getChar()
@@ -1845,16 +2355,29 @@ do
             end
 
             local now = os.clock()
-            if now - lastInvCheck >= 0.3 then
+            if now - lastInvCheck >= 0.15 then
                 lastInvCheck = now
-                if inventoryIncreased(invBefore, snapshotInventory()) then
+                if inventoryIncreased(invBefore, snapshotInventory(), info) then
                     result, why = "coletado", "item no inventário"
                     break
                 end
             end
 
-            if horizontal(root.Position, info.Center) > reach + MINER_CFG.ReachBuffer then
-                result = "longe"
+            if verifyBreakUntil then
+                if now >= verifyBreakUntil then
+                    result = "sem-quebra-apos-5"
+                    why = "cristal não destruído após 5 cliques"
+                    break
+                end
+                task.wait(0.05)
+                continue
+            end
+
+            local horizontalDistance = horizontal(root.Position, info.Center)
+            local verticalDistance = math.abs(root.Position.Y - info.Center.Y)
+            if horizontalDistance > reach + MINER_CFG.ReachBuffer
+                or verticalDistance > MINER_CFG.MaxVerticalReach then
+                result = "inalcancavel"
                 break
             end
 
@@ -1863,7 +2386,8 @@ do
                 break
             end
 
-            setStatus(string.format("minerando %s (coletados: %d)", tostring(info.Name), AutoMiner.Collected))
+            setStatus(string.format("minerando %s (coletados: %d | golpes: %d/%d)",
+                tostring(info.Name), AutoMiner.Collected, clickAttempts, MINER_CFG.MaxClicksWithoutBreak))
             hum:MoveTo(root.Position)
             faceTo(root, info.Center)
             aimTarget = info.Center
@@ -1871,7 +2395,14 @@ do
             if CombatCfg.SkillBusy then
                 task.wait(0.03)
             else
-                pcall(clickOnce)
+                local clickOk, clickSent = pcall(clickOnce)
+                if clickOk and clickSent then
+                    clickAttempts = clickAttempts + 1
+                    if clickAttempts >= MINER_CFG.MaxClicksWithoutBreak then
+                        verifyBreakUntil = os.clock() + MINER_CFG.FifthClickVerifyDelay
+                        setStatus("verificando se " .. tostring(info.Name) .. " foi destruído após 5 cliques...", true)
+                    end
+                end
                 task.wait(MINER_CFG.ClickDelay)
             end
         end
@@ -1884,23 +2415,25 @@ do
         local deadline = os.clock() + MINER_CFG.TargetMaxTime
 
         while isActive(token) and os.clock() < deadline do
-            local walked = walkTo(info, token)
-            if walked ~= "arrived" then
+            local walked, nextInfo = walkTo(info, token)
+            if walked == "retarget" and nextInfo then
+                info = nextInfo
+                AutoMiner.Target = info.Inst
                 setMoving(false)
-                return walked
-            end
-
-            local result, why = mineLoop(info, token)
-            if result ~= "longe" then
-                return result, why
+            elseif walked ~= "arrived" then
+                setMoving(false)
+                return walked, nil, info
+            else
+                local result, why = mineLoop(info, token)
+                return result, why, info
             end
         end
 
         setMoving(false)
         if isActive(token) then
-            return "timeout"
+            return "timeout", nil, info
         end
-        return "parou"
+        return "parou", nil, info
     end
 
     local function step(token)
@@ -1921,7 +2454,7 @@ do
             return
         end
 
-        setStatus("procurando ore no chão...")
+        setStatus("procurando o ore válido mais próximo...")
         local info, stats = pickTarget(root, token)
         if not isActive(token) then return end
 
@@ -1929,7 +2462,7 @@ do
             setMoving(false)
             AutoMiner.Target = nil
             setStatus(string.format(
-                "nenhum ore válido no chão (cristais: %d | no chão: %d | descartados: %d)",
+                "nenhum ore válido acessível por perto (detectados: %d | avaliados: %d | descartados: %d)",
                 stats.Total, stats.Ground, stats.Rejected + stats.Blocked
             ))
             if stats.PathTries >= MINER_CFG.MaxPathChecks then
@@ -1941,7 +2474,8 @@ do
         end
 
         AutoMiner.Target = info.Inst
-        local result, why = mineTarget(info, token)
+        local result, why, finalInfo = mineTarget(info, token)
+        info = finalInfo or info
         AutoMiner.Target = nil
         aimTarget = nil
 
@@ -1955,6 +2489,10 @@ do
         elseif result == "sumiu" then
             blockSpot(info.Center, 10)
             setStatus("o ore sumiu antes de minerar, procurando o próximo", true)
+        elseif result == "sem-quebra-apos-5" then
+            rejected[info.Inst] = os.clock() + MINER_CFG.IgnoreTime
+            setStatus("5 cliques sem destruir " .. tostring(info.Name)
+                .. " (provável parede/teto ou alvo inacessível); ignorando e indo ao próximo ore", true)
         elseif result == "inalcancavel" or result == "timeout" then
             rejected[info.Inst] = os.clock() + MINER_CFG.IgnoreTime
             if result == "timeout" then
@@ -1979,13 +2517,15 @@ do
         end
 
         blocked = {}
+        candidateCache = nil
+        candidateCacheAt = 0
         for k in pairs(rejected) do
             rejected[k] = nil
         end
         AutoMiner.Collected = 0
         aimTarget = nil
 
-        setStatus("procurando ore no chão...", true)
+        setStatus("procurando o ore mais próximo...", true)
 
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
         RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 1, onRenderStep)
@@ -2522,7 +3062,56 @@ local function createUpdateCard(parent, layoutOrder, titleText, descText)
     return card
 end
 
-createUpdateCard(HomePage, 1, "v4", "+Auto Minner ( Beta )")
+-- ✅ Botão Join Discord
+local DiscordCard = Instance.new("Frame")
+DiscordCard.Name = "DiscordCard"
+DiscordCard.Size = UDim2.new(1, 0, 0, 56)
+DiscordCard.BackgroundColor3 = Theme.Accent1
+DiscordCard.BorderSizePixel = 0
+DiscordCard.LayoutOrder = 1
+DiscordCard.Parent = HomePage
+addCorner(DiscordCard, 14)
+addStroke(DiscordCard, Theme.Stroke, 1, 0.5)
+addGradient(DiscordCard, Theme.Accent1, Theme.Accent2, 45)
+
+local DiscordText = Instance.new("TextLabel")
+DiscordText.Size = UDim2.new(1, -32, 1, 0)
+DiscordText.Position = UDim2.new(0, 16, 0, 0)
+DiscordText.BackgroundTransparency = 1
+DiscordText.Text = "Join Discord"
+DiscordText.TextColor3 = Color3.fromRGB(255, 255, 255)
+DiscordText.Font = Enum.Font.GothamBold
+DiscordText.TextSize = 16
+DiscordText.TextXAlignment = Enum.TextXAlignment.Center
+DiscordText.Parent = DiscordCard
+
+local DiscordBtn = Instance.new("TextButton")
+DiscordBtn.Size = UDim2.new(1, 0, 1, 0)
+DiscordBtn.BackgroundTransparency = 1
+DiscordBtn.Text = ""
+DiscordBtn.ZIndex = 2
+DiscordBtn.Parent = DiscordCard
+
+DiscordBtn.MouseButton1Click:Connect(function()
+    local url = "https://discord.gg/wstMsZp2za"
+    local ok = pcall(function()
+        GuiService:OpenBrowserWindow(url)
+    end)
+    if not ok then
+        pcall(function()
+            setclipboard(url)
+        end)
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Discord",
+                Text = "Link copiado para a área de transferência!",
+                Duration = 4,
+            })
+        end)
+    end
+end)
+
+createUpdateCard(HomePage, 2, "v4.1", "+ Melhorias no Auto Miner")
 
 --// ==========================================
 --// ABA COMBAT
@@ -2901,7 +3490,7 @@ setAutoMiner, getAutoMiner = createToggleCard(
 -- ✅ Linha de status
 local MinerStatus = Instance.new("TextLabel")
 MinerStatus.Name = "MinerStatus"
-MinerStatus.Size = UDim2.new(1, 0, 0, 34)
+MinerStatus.Size = UDim2.new(1, 0, 0, 30)
 MinerStatus.BackgroundTransparency = 1
 MinerStatus.Text = "Status: desligado"
 MinerStatus.TextColor3 = Theme.TextDim
@@ -3521,7 +4110,7 @@ tween(Main, {Size = CONFIG.UISize, Position = CONFIG.UIOffset}, 0.35, Enum.Easin
 pcall(function()
     StarterGui:SetCore("SendNotification", {
         Title = "RAMDOM HUB v" .. CONFIG.Version,
-        Text = "Auto Farm e Otimização atualizados!",
+        Text = "Auto Farm, Auto Miner e Otimização atualizados!",
         Duration = 5,
     })
 end)
