@@ -1,16 +1,13 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
     ║                 RAMDOM HUB  v4                       ║
-    ║ Combat, Home, Auto Mobs, Auto Minner, Otimização, Config ║
+    ║ Combat, Home, Auto Farm, Auto Minner, Otimização, Config ║
     ╚══════════════════════════════════════════════════════╝
 
     v4:
       + Auto Minner ( Beta )
-      - Otimização carrega o mapa com gráfico no máximo, esconde as estruturas e restaura o gráfico.
-      - Nova aba "Auto Minner" (logo abaixo de Auto Mobs).
-        Anda (sem teleporte) até o cristal/ore válido mais próximo que esteja NO CHÃO,
-        minera com cliques repetidos, confirma a coleta e segue pro próximo.
-        Auto Miner e Auto Mob nunca rodam juntos.
+      - Otimização apaga estruturas aos poucos (anti-travamento).
+      - Localizar Estruturas: mostra hitboxes num raio de 100 studs.
 ]]
 
 --// Serviços
@@ -50,11 +47,12 @@ local CONFIG = {
 --// UI principal
 local ScreenGui, Main
 
---// Toggle do Auto Miner
+--// Toggles compartilhados
 local setAutoMiner, getAutoMiner
+local setLocateStructures, getLocateStructures
 
 --// ==========================================
---// AUTO MOB — CONFIG E ESTADO
+--// AUTO FARM (MOB) — CONFIG E ESTADO
 --// ==========================================
 local MOB_CFG = {
     SearchRadius = 150,          
@@ -489,7 +487,7 @@ local function stopNoclip()
 end
 
 --// ==========================================
---// AUTO MOB — MOTOR
+--// AUTO FARM (MOB) — MOTOR
 --// ==========================================
 do
     local STEER_NAME = "RamdomHubAutoMobSteer"
@@ -1020,7 +1018,7 @@ do
             while isActive(token) do
                 local ok, err = pcall(step, token)
                 if not ok then
-                    warn("[RAMDOM HUB] Auto Mob erro: " .. tostring(err))
+                    warn("[RAMDOM HUB] Auto Farm erro: " .. tostring(err))
                     setMoving(false)
                     steerPart = nil
                     AutoMob.Target = nil
@@ -1908,7 +1906,7 @@ do
     local function step(token)
         if AutoMob.Enabled then
             setMoving(false)
-            setStatus("pausado: desligue o Auto Mob para minerar")
+            setStatus("pausado: desligue o Auto Farm para minerar")
             task.wait(0.5)
             return
         end
@@ -2449,7 +2447,7 @@ end
 
 createTabButton("Home", "Home", 1)
 createTabButton("Combat", "Combat", 2)
-createTabButton("AutoMobs", "Auto Mobs", 3)
+createTabButton("AutoMobs", "Auto Farm", 3)
 createTabButton("AutoMiner", "Auto Minner", 4)
 createTabButton("Otimizacao", "Otimização", 5)
 createTabButton("Config", "Config", 6)
@@ -2727,13 +2725,13 @@ local setAutoAttack, getAutoAttack = createToggleCard(
 )
 
 --// ==========================================
---// ABA AUTO MOBS
+--// ABA AUTO FARM
 --// ==========================================
 
 local setAutoMob, getAutoMob = createToggleCard(
     AutoMobsPage,
     1,
-    "Auto Mob",
+    "Auto Farm",
     false,
     function(state)
         if state then
@@ -3046,6 +3044,9 @@ startNoclip()
 local OriginalStructures = {}
 local OriginalGraphics = settings().Rendering.QualityLevel
 local optimizationConnection = nil
+local StructureHighlights = {}
+local LocateThread = nil
+local LOCATE_RADIUS = 100
 
 local setOtimizacao, getOtimizacao
 
@@ -3110,6 +3111,58 @@ local function isIndicator(obj)
     return false
 end
 
+local function addHighlight(obj)
+    if not obj or not obj.Parent or not obj:IsA("BasePart") then return end
+    if StructureHighlights[obj] then return end
+
+    local sb = Instance.new("SelectionBox")
+    sb.Adornee = obj
+    sb.Color3 = Color3.fromRGB(120, 90, 255)
+    sb.LineThickness = 0.05
+    sb.SurfaceTransparency = 1
+    sb.Parent = obj
+    StructureHighlights[obj] = sb
+end
+
+local function removeHighlight(obj)
+    if StructureHighlights[obj] then
+        pcall(function() StructureHighlights[obj]:Destroy() end)
+        StructureHighlights[obj] = nil
+    end
+end
+
+local function removeAllHighlights()
+    for obj, sb in pairs(StructureHighlights) do
+        pcall(function() sb:Destroy() end)
+    end
+    StructureHighlights = {}
+end
+
+local function updateHighlightsLoop()
+    if LocateThread then task.cancel(LocateThread) end
+    LocateThread = task.spawn(function()
+        while getLocateStructures and getLocateStructures() do
+            local char = player.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local pos = root and root.Position
+
+            if pos then
+                for _, data in ipairs(OriginalStructures) do
+                    if data.type == "part" and data.obj and data.obj.Parent then
+                        local dist = (data.obj.Position - pos).Magnitude
+                        if dist <= LOCATE_RADIUS then
+                            addHighlight(data.obj)
+                        else
+                            removeHighlight(data.obj)
+                        end
+                    end
+                end
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+
 local function processStructure(obj)
     if isCharacterObject(obj) or isIndicator(obj) then return end
 
@@ -3158,16 +3211,31 @@ local function hideStructures()
     end
 
     OriginalStructures = {}
+    local descendants = workspace:GetDescendants()
+    local count = 0
 
-    for _, obj in ipairs(workspace:GetDescendants()) do
+    for _, obj in ipairs(descendants) do
+        if not (getOtimizacao and getOtimizacao()) then break end
+        
         processStructure(obj)
+        count = count + 1
+        
+        -- Pausa a cada 500 itens processados para não travar o jogo
+        if count % 500 == 0 then
+            task.wait()
+        end
     end
 
-    optimizationConnection = workspace.DescendantAdded:Connect(function(obj)
-        task.wait(0.1)
-        processStructure(obj)
-    end)
-
+    if getOtimizacao and getOtimizacao() then
+        optimizationConnection = workspace.DescendantAdded:Connect(function(obj)
+            task.spawn(function()
+                task.wait(0.1)
+                if getOtimizacao and getOtimizacao() then
+                    processStructure(obj)
+                end
+            end)
+        end)
+    end
     print(("[RAMDOM HUB] Estruturas escondidas: %d objetos"):format(#OriginalStructures))
 end
 
@@ -3176,6 +3244,12 @@ local function restoreStructures()
         optimizationConnection:Disconnect()
         optimizationConnection = nil
     end
+
+    if LocateThread then
+        pcall(task.cancel, LocateThread)
+        LocateThread = nil
+    end
+    removeAllHighlights()
 
     for _, data in ipairs(OriginalStructures) do
         pcall(function()
@@ -3208,7 +3282,7 @@ local function waitAndHide(stateChecker)
             
             StarterGui:SetCore("SendNotification", {
                 Title = "Otimização",
-                Text = "Aumentando gráfico e carregando o mapa inteiro. Aguarde...",
+                Text = "Aumentando gráfico e carregando o mapa. Aguarde...",
                 Duration = 4,
             })
         end)
@@ -3233,6 +3307,9 @@ local function waitAndHide(stateChecker)
 
         if optimizationLoading and stateChecker() then
             hideStructures()
+            if getLocateStructures and getLocateStructures() then
+                updateHighlightsLoop()
+            end
         end
 
         pcall(function()
@@ -3253,6 +3330,9 @@ setOtimizacao, getOtimizacao = createToggleCard(
             waitAndHide(function() return getOtimizacao and getOtimizacao() end)
         else
             optimizationLoading = false
+            if getLocateStructures and getLocateStructures() then
+                setLocateStructures(false)
+            end
             restoreStructures()
             pcall(function()
                 settings().Rendering.QualityLevel = OriginalGraphics
@@ -3261,11 +3341,43 @@ setOtimizacao, getOtimizacao = createToggleCard(
     end
 )
 
+-- ✅ Nova Toggle: Localizar Estruturas
+local setLocate, getLocate = createToggleCard(
+    OptPage,
+    2,
+    "Localizar Estruturas",
+    false,
+    function(state)
+        if state then
+            if getOtimizacao and getOtimizacao() then
+                updateHighlightsLoop()
+            else
+                pcall(function()
+                    StarterGui:SetCore("SendNotification", {
+                        Title = "Aviso",
+                        Text = "Ative a Otimização primeiro!",
+                        Duration = 3,
+                    })
+                end)
+                setLocate(false)
+            end
+        else
+            if LocateThread then
+                pcall(task.cancel, LocateThread)
+                LocateThread = nil
+            end
+            removeAllHighlights()
+        end
+    end
+)
+setLocateStructures = setLocate
+getLocateStructures = getLocate
+
 local CardOptDesc = Instance.new("Frame")
 CardOptDesc.Size = UDim2.new(1, 0, 0, 85)
 CardOptDesc.BackgroundColor3 = Theme.Card
 CardOptDesc.BorderSizePixel = 0
-CardOptDesc.LayoutOrder = 2
+CardOptDesc.LayoutOrder = 3
 CardOptDesc.Parent = OptPage
 addCorner(CardOptDesc, 14)
 addStroke(CardOptDesc, Theme.Stroke, 1, 0.5)
@@ -3286,7 +3398,7 @@ local OptDescText = Instance.new("TextLabel")
 OptDescText.Size = UDim2.new(1, -32, 0, 45)
 OptDescText.Position = UDim2.new(0, 16, 0, 32)
 OptDescText.BackgroundTransparency = 1
-OptDescText.Text = "Aumenta o gráfico ao máximo para carregar o mapa inteiro e depois oculta todas as estruturas, garantindo fluidez e sem travamentos. Ao desativar, tudo volta ao normal."
+OptDescText.Text = "Aumenta o gráfico para carregar o mapa e apaga as estruturas aos poucos para não travar. Use 'Localizar Estruturas' para ver hitboxes num raio de 100 studs."
 OptDescText.TextColor3 = Theme.TextDim
 OptDescText.Font = Enum.Font.Gotham
 OptDescText.TextSize = 12
@@ -3409,7 +3521,7 @@ tween(Main, {Size = CONFIG.UISize, Position = CONFIG.UIOffset}, 0.35, Enum.Easin
 pcall(function()
     StarterGui:SetCore("SendNotification", {
         Title = "RAMDOM HUB v" .. CONFIG.Version,
-        Text = "Nova aba Auto Minner! Auto Click, Auto Skill e Auto Mob também atualizados.",
+        Text = "Auto Farm e Otimização atualizados!",
         Duration = 5,
     })
 end)
