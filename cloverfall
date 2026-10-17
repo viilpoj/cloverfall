@@ -1,6 +1,6 @@
 --[[
     ╔═══════════════════════════════════════╗
-    ║        RAMDOM HUB  v2.9               ║
+    ║        RAMDOM HUB  v3.0               ║
     ║   Home, Auto Farm, Otimização, Config ║
     ╚═══════════════════════════════════════╝
 ]]
@@ -24,7 +24,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "2.9",
+    Version = "3.0",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -648,9 +648,9 @@ local function createUpdateCard(parent, layoutOrder, versionText, titleText, des
     return card
 end
 
-createUpdateCard(HomePage, 1, "v2.9", "Otimização Ultra", "Adicionada a opção Otimização Ultra: remove estruturas e reduz drasticamente os gráficos.")
-createUpdateCard(HomePage, 2, "v2.8", "Otimização Simplificada", "A otimização padrão agora foca exclusivamente em apagar as estruturas do mapa.")
-createUpdateCard(HomePage, 3, "v2.7", "Gráfico Normal", "A otimização agora reduz os gráficos em vez de aumentar, mantendo a remoção de estruturas.")
+createUpdateCard(HomePage, 1, "v3.0", "Sistema Exclusivo", "As Otimizações Normal e Ultra agora são exclusivas: ativar uma desliga a outra automaticamente.")
+createUpdateCard(HomePage, 2, "v2.9", "Otimização Ultra", "Adicionada a opção Otimização Ultra: remove estruturas e reduz drasticamente os gráficos.")
+createUpdateCard(HomePage, 3, "v2.8", "Otimização Simplificada", "A otimização padrão agora foca exclusivamente em apagar as estruturas do mapa.")
 
 --// ==========================================
 --// ABA AUTO FARM
@@ -797,6 +797,10 @@ startNoclip()
 local OriginalStructures = {}
 local OriginalGraphics = Enum.QualityLevel.Automatic
 
+-- Declarando as variáveis antes para permitir a exclusão mútua
+local setOtimizacao, getOtimizacao
+local setOtimizacaoUltra, getOtimizacaoUltra
+
 local function isCharacterObject(obj)
     local current = obj
     while current and current ~= workspace do
@@ -926,13 +930,17 @@ local function restoreStructures()
 end
 
 -- Toggle: Otimização Normal
-local setOtimizacao, getOtimizacao = createToggleCard(
+setOtimizacao, getOtimizacao = createToggleCard(
     OptPage,
     1,
     "Otimização",
     false,
     function(state)
         if state then
+            -- ✅ Exclusão mútua: Desativa a Ultra se estiver ligada
+            if getOtimizacaoUltra and getOtimizacaoUltra() then
+                setOtimizacaoUltra(false)
+            end
             hideStructures()
         else
             restoreStructures()
@@ -976,13 +984,17 @@ OptDescText.TextWrapped = true
 OptDescText.Parent = CardOptDesc
 
 -- ✅ Toggle: Otimização Ultra
-local setOtimizacaoUltra, getOtimizacaoUltra = createToggleCard(
+setOtimizacaoUltra, getOtimizacaoUltra = createToggleCard(
     OptPage,
     3,
     "Otimização Ultra",
     false,
     function(state)
         if state then
+            -- ✅ Exclusão mútua: Desativa a Normal se estiver ligada
+            if getOtimizacao and getOtimizacao() then
+                setOtimizacao(false)
+            end
             -- Salva o gráfico atual e reduz para o mínimo
             pcall(function()
                 OriginalGraphics = settings().Rendering.QualityLevel
@@ -1140,7 +1152,7 @@ tween(Main, {Size = CONFIG.UISize, Position = CONFIG.UIOffset}, 0.35, Enum.Easin
 pcall(function()
     StarterGui:SetCore("SendNotification", {
         Title = "RAMDOM HUB v" .. CONFIG.Version,
-        Text = "Otimização Ultra adicionada!",
+        Text = "Sistema exclusivo adicionado!",
         Duration = 5,
     })
 end)
