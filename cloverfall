@@ -1,7 +1,7 @@
 --[[
     ╔═══════════════════════════════════════╗
-    ║        RAMDOM HUB  v2.1               ║
-    ║   Otimização + Config (Anti-AFK)      ║
+    ║        RAMDOM HUB  v2.9               ║
+    ║   Home, Auto Farm, Otimização, Config ║
     ╚═══════════════════════════════════════╝
 ]]
 
@@ -12,7 +12,6 @@ local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
 local StarterGui = game:GetService("StarterGui")
 local TweenService = game:GetService("TweenService")
-local Lighting = game:GetService("Lighting")
 
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
@@ -25,7 +24,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "2.1",
+    Version = "2.9",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -38,8 +37,8 @@ local Theme = {
     Card         = Color3.fromRGB(32, 32, 42),
     CardHover    = Color3.fromRGB(40, 40, 52),
     Stroke       = Color3.fromRGB(60, 60, 80),
-    Accent1      = Color3.fromRGB(120, 90, 255),
-    Accent2      = Color3.fromRGB(80, 180, 255),
+    Accent1      = Color3.fromRGB(120, 90, 255), -- Roxo
+    Accent2      = Color3.fromRGB(80, 180, 255), -- Azul
     Success      = Color3.fromRGB(60, 220, 130),
     Danger       = Color3.fromRGB(255, 80, 110),
     DangerDark   = Color3.fromRGB(180, 40, 70),
@@ -49,17 +48,11 @@ local Theme = {
     TrackOff     = Color3.fromRGB(50, 50, 65),
 }
 
---// ============================================
 --// CORES DOS TOGGLES
---// ============================================
-
--- ✅ QUANDO ATIVADO (ON) — gradiente Azul → Roxo
 local TOGGLE_ON = ColorSequence.new{
     ColorSequenceKeypoint.new(0, Color3.fromRGB(80, 180, 255)),
     ColorSequenceKeypoint.new(1, Color3.fromRGB(120, 90, 255)),
 }
-
--- ❌ QUANDO DESATIVADO (OFF) — gradiente Vermelho
 local TOGGLE_OFF = ColorSequence.new{
     ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 80, 110)),
     ColorSequenceKeypoint.new(1, Color3.fromRGB(180, 40, 70)),
@@ -136,7 +129,7 @@ local function makeDraggable(handle, target)
 end
 
 --// ==========================================
---// SISTEMA DE TOGGLE (compartilhado)
+--// SISTEMA DE TOGGLE
 --// ==========================================
 local function createToggleCard(parent, layoutOrder, label, defaultOn, callback)
     local card = Instance.new("Frame")
@@ -236,12 +229,6 @@ local function performAntiAFKClick()
         task.wait(0.05)
         vu:Button1Up(Vector2.new(0, 0))
     end)
-    pcall(function()
-        local mouse = player:GetMouse()
-        if mouse then
-            mouse.Move:Connect(function() end)
-        end
-    end)
 end
 
 local function startAntiAFK()
@@ -266,6 +253,41 @@ player.Idled:Connect(function()
         performAntiAFKClick()
     end
 end)
+
+--// ==========================================
+--// NOCLIP
+--// ==========================================
+local NoclipEnabled = false
+local NoclipConnection = nil
+
+local function startNoclip()
+    NoclipEnabled = true
+    if NoclipConnection then return end
+    NoclipConnection = RunService.Stepped:Connect(function()
+        if NoclipEnabled and player.Character then
+            for _, part in ipairs(player.Character:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end
+    end)
+end
+
+local function stopNoclip()
+    NoclipEnabled = false
+    if NoclipConnection then
+        NoclipConnection:Disconnect()
+        NoclipConnection = nil
+    end
+    if player.Character then
+        for _, part in ipairs(player.Character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = true
+            end
+        end
+    end
+end
 
 --// ==========================================
 --// UI GRANDE
@@ -479,10 +501,12 @@ local function createPage(name)
     return page
 end
 
+local HomePage = createPage("Home")
+local AutoFarmPage = createPage("AutoFarm")
 local OptPage = createPage("Otimizacao")
 local ConfigPage = createPage("Config")
 
---// Botões da aba
+--// Botões da aba (Com texto em Gradiente)
 local function createTabButton(id, label, order)
     local btn = Instance.new("TextButton")
     btn.Name = "Tab_" .. id
@@ -490,20 +514,35 @@ local function createTabButton(id, label, order)
     btn.BackgroundColor3 = Theme.Card
     btn.BackgroundTransparency = 1
     btn.BorderSizePixel = 0
-    btn.Text = label
-    btn.TextColor3 = Theme.Accent2
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 14
-    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.Text = ""
     btn.AutoButtonColor = false
     btn.LayoutOrder = order
     btn.ZIndex = 3
     btn.Parent = Sidebar
     addCorner(btn, 8)
 
-    local btnPad = Instance.new("UIPadding")
-    btnPad.PaddingLeft = UDim.new(0, 16)
-    btnPad.Parent = btn
+    local textLabel = Instance.new("TextLabel")
+    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.BackgroundTransparency = 1
+    textLabel.Text = label
+    textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    textLabel.Font = Enum.Font.GothamBold
+    textLabel.TextSize = 14
+    textLabel.TextXAlignment = Enum.TextXAlignment.Left
+    textLabel.ZIndex = 4
+    textLabel.Parent = btn
+    
+    local textPad = Instance.new("UIPadding")
+    textPad.PaddingLeft = UDim.new(0, 16)
+    textPad.Parent = textLabel
+
+    -- ✅ Gradiente no texto da aba (Metade Roxo, Metade Azul)
+    local textGrad = Instance.new("UIGradient")
+    textGrad.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Theme.Accent1), -- Roxo
+        ColorSequenceKeypoint.new(1, Theme.Accent2), -- Azul
+    }
+    textGrad.Parent = textLabel
 
     local indicator = Instance.new("Frame")
     indicator.Name = "Indicator"
@@ -512,16 +551,18 @@ local function createTabButton(id, label, order)
     indicator.BackgroundColor3 = Theme.Accent1
     indicator.BorderSizePixel = 0
     indicator.Visible = false
-    indicator.ZIndex = 4
+    indicator.ZIndex = 5
     indicator.Parent = btn
     addCorner(indicator, 2)
 
-    Tabs[id] = {btn = btn, indicator = indicator}
+    Tabs[id] = {btn = btn, indicator = indicator, textLabel = textLabel}
     return btn
 end
 
-createTabButton("Otimizacao", "Otimização", 1)
-createTabButton("Config", "Config", 2)
+createTabButton("Home", "Home", 1)
+createTabButton("AutoFarm", "Auto Farm", 2)
+createTabButton("Otimizacao", "Otimização", 3)
+createTabButton("Config", "Config", 4)
 
 local currentTab = nil
 local function setTab(id)
@@ -533,10 +574,10 @@ local function setTab(id)
         if active then
             data.btn.BackgroundTransparency = 0
             data.btn.BackgroundColor3 = Theme.Card
-            data.btn.TextColor3 = Theme.Text
+            data.textLabel.TextTransparency = 0
         else
             data.btn.BackgroundTransparency = 1
-            data.btn.TextColor3 = Theme.Accent2
+            data.textLabel.TextTransparency = 0.2
         end
     end
     for name, page in pairs(Pages) do
@@ -550,13 +591,89 @@ for name, data in pairs(Tabs) do
     end)
 end
 
-setTab("Otimizacao")
+setTab("Home")
+
+--// ==========================================
+--// ABA HOME (Changelog)
+--// ==========================================
+
+local function createUpdateCard(parent, layoutOrder, versionText, titleText, descText)
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, 0, 0, 90)
+    card.BackgroundColor3 = Theme.Card
+    card.BorderSizePixel = 0
+    card.LayoutOrder = layoutOrder
+    card.Parent = parent
+    addCorner(card, 14)
+    addStroke(card, Theme.Stroke, 1, 0.5)
+    addGradient(card, Theme.CardHover, Theme.Card, 90)
+
+    local vLabel = Instance.new("TextLabel")
+    vLabel.Size = UDim2.new(0, 60, 0, 24)
+    vLabel.Position = UDim2.new(0, 16, 0, 14)
+    vLabel.BackgroundColor3 = Theme.Accent1
+    vLabel.BorderSizePixel = 0
+    vLabel.Text = versionText
+    vLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    vLabel.Font = Enum.Font.GothamBold
+    vLabel.TextSize = 12
+    vLabel.Parent = card
+    addCorner(vLabel, 6)
+    addGradient(vLabel, Theme.Accent1, Theme.Accent2, 0)
+
+    local tLabel = Instance.new("TextLabel")
+    tLabel.Size = UDim2.new(1, -90, 0, 24)
+    tLabel.Position = UDim2.new(0, 85, 0, 14)
+    tLabel.BackgroundTransparency = 1
+    tLabel.Text = titleText
+    tLabel.TextColor3 = Theme.Text
+    tLabel.Font = Enum.Font.GothamBold
+    tLabel.TextSize = 14
+    tLabel.TextXAlignment = Enum.TextXAlignment.Left
+    tLabel.Parent = card
+
+    local dLabel = Instance.new("TextLabel")
+    dLabel.Size = UDim2.new(1, -32, 0, 40)
+    dLabel.Position = UDim2.new(0, 16, 0, 42)
+    dLabel.BackgroundTransparency = 1
+    dLabel.Text = descText
+    dLabel.TextColor3 = Theme.TextDim
+    dLabel.Font = Enum.Font.Gotham
+    dLabel.TextSize = 12
+    dLabel.TextXAlignment = Enum.TextXAlignment.Left
+    dLabel.TextWrapped = true
+    dLabel.TextYAlignment = Enum.TextYAlignment.Top
+    dLabel.Parent = card
+
+    return card
+end
+
+createUpdateCard(HomePage, 1, "v2.9", "Otimização Ultra", "Adicionada a opção Otimização Ultra: remove estruturas e reduz drasticamente os gráficos.")
+createUpdateCard(HomePage, 2, "v2.8", "Otimização Simplificada", "A otimização padrão agora foca exclusivamente em apagar as estruturas do mapa.")
+createUpdateCard(HomePage, 3, "v2.7", "Gráfico Normal", "A otimização agora reduz os gráficos em vez de aumentar, mantendo a remoção de estruturas.")
+
+--// ==========================================
+--// ABA AUTO FARM
+--// ==========================================
+
+local setAutoFarm, getAutoFarm = createToggleCard(
+    AutoFarmPage,
+    1,
+    "Auto Farm",
+    false,
+    function(state)
+        if state then
+            print("[RAMDOM HUB] Auto Farm ATIVADO (Adicione sua lógica aqui)")
+        else
+            print("[RAMDOM HUB] Auto Farm DESATIVADO")
+        end
+    end
+)
 
 --// ==========================================
 --// ABA CONFIG
 --// ==========================================
 
--- Card: Escala de UI
 local CardConfig = Instance.new("Frame")
 CardConfig.Size = UDim2.new(1, 0, 0, 72)
 CardConfig.BackgroundColor3 = Theme.Card
@@ -641,7 +758,7 @@ UserInputService.InputEnded:Connect(function(i)
     end
 end)
 
--- ✅ Card: Anti-AFK (vem ativado por padrão)
+-- ✅ Anti-AFK
 local setAntiAFK, getAntiAFK = createToggleCard(
     ConfigPage,
     2,
@@ -657,12 +774,28 @@ local setAntiAFK, getAntiAFK = createToggleCard(
 )
 startAntiAFK()
 
+-- ✅ Noclip
+local setNoclip, getNoclip = createToggleCard(
+    ConfigPage,
+    3,
+    "Noclip",
+    true,
+    function(state)
+        if state then
+            startNoclip()
+        else
+            stopNoclip()
+        end
+    end
+)
+startNoclip()
+
 --// ==========================================
 --// ABA OTIMIZAÇÃO
 --// ==========================================
 
--- LÓGICA: ESCONDER ESTRUTURAS
 local OriginalStructures = {}
+local OriginalGraphics = Enum.QualityLevel.Automatic
 
 local function isCharacterObject(obj)
     local current = obj
@@ -792,7 +925,7 @@ local function restoreStructures()
     print("[RAMDOM HUB] Estruturas restauradas!")
 end
 
--- Toggle: Otimização
+-- Toggle: Otimização Normal
 local setOtimizacao, getOtimizacao = createToggleCard(
     OptPage,
     1,
@@ -806,6 +939,100 @@ local setOtimizacao, getOtimizacao = createToggleCard(
         end
     end
 )
+
+-- ✅ Card de Descrição da Otimização Normal
+local CardOptDesc = Instance.new("Frame")
+CardOptDesc.Size = UDim2.new(1, 0, 0, 85)
+CardOptDesc.BackgroundColor3 = Theme.Card
+CardOptDesc.BorderSizePixel = 0
+CardOptDesc.LayoutOrder = 2
+CardOptDesc.Parent = OptPage
+addCorner(CardOptDesc, 14)
+addStroke(CardOptDesc, Theme.Stroke, 1, 0.5)
+addGradient(CardOptDesc, Theme.CardHover, Theme.Card, 90)
+
+local OptDescTitle = Instance.new("TextLabel")
+OptDescTitle.Size = UDim2.new(1, -32, 0, 20)
+OptDescTitle.Position = UDim2.new(0, 16, 0, 12)
+OptDescTitle.BackgroundTransparency = 1
+OptDescTitle.Text = "Descrição"
+OptDescTitle.TextColor3 = Theme.Text
+OptDescTitle.Font = Enum.Font.GothamBold
+OptDescTitle.TextSize = 13
+OptDescTitle.TextXAlignment = Enum.TextXAlignment.Left
+OptDescTitle.Parent = CardOptDesc
+
+local OptDescText = Instance.new("TextLabel")
+OptDescText.Size = UDim2.new(1, -32, 0, 45)
+OptDescText.Position = UDim2.new(0, 16, 0, 32)
+OptDescText.BackgroundTransparency = 1
+OptDescText.Text = "Oculta todas as estruturas do mapa para garantir uma otimização fluida e sem travamentos. Seu gráfico permanece intacto. Ao desativar, todas as estruturas são restauradas ao seu estado original."
+OptDescText.TextColor3 = Theme.TextDim
+OptDescText.Font = Enum.Font.Gotham
+OptDescText.TextSize = 12
+OptDescText.TextXAlignment = Enum.TextXAlignment.Left
+OptDescText.TextYAlignment = Enum.TextYAlignment.Top
+OptDescText.TextWrapped = true
+OptDescText.Parent = CardOptDesc
+
+-- ✅ Toggle: Otimização Ultra
+local setOtimizacaoUltra, getOtimizacaoUltra = createToggleCard(
+    OptPage,
+    3,
+    "Otimização Ultra",
+    false,
+    function(state)
+        if state then
+            -- Salva o gráfico atual e reduz para o mínimo
+            pcall(function()
+                OriginalGraphics = settings().Rendering.QualityLevel
+                settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+            end)
+            hideStructures()
+        else
+            -- Restaura o gráfico original e as estruturas
+            pcall(function()
+                settings().Rendering.QualityLevel = OriginalGraphics
+            end)
+            restoreStructures()
+        end
+    end
+)
+
+-- ✅ Card de Descrição da Otimização Ultra
+local CardOptUltraDesc = Instance.new("Frame")
+CardOptUltraDesc.Size = UDim2.new(1, 0, 0, 85)
+CardOptUltraDesc.BackgroundColor3 = Theme.Card
+CardOptUltraDesc.BorderSizePixel = 0
+CardOptUltraDesc.LayoutOrder = 4
+CardOptUltraDesc.Parent = OptPage
+addCorner(CardOptUltraDesc, 14)
+addStroke(CardOptUltraDesc, Theme.Stroke, 1, 0.5)
+addGradient(CardOptUltraDesc, Theme.CardHover, Theme.Card, 90)
+
+local OptUltraTitle = Instance.new("TextLabel")
+OptUltraTitle.Size = UDim2.new(1, -32, 0, 20)
+OptUltraTitle.Position = UDim2.new(0, 16, 0, 12)
+OptUltraTitle.BackgroundTransparency = 1
+OptUltraTitle.Text = "Descrição"
+OptUltraTitle.TextColor3 = Theme.Text
+OptUltraTitle.Font = Enum.Font.GothamBold
+OptUltraTitle.TextSize = 13
+OptUltraTitle.TextXAlignment = Enum.TextXAlignment.Left
+OptUltraTitle.Parent = CardOptUltraDesc
+
+local OptUltraText = Instance.new("TextLabel")
+OptUltraText.Size = UDim2.new(1, -32, 0, 45)
+OptUltraText.Position = UDim2.new(0, 16, 0, 32)
+OptUltraText.BackgroundTransparency = 1
+OptUltraText.Text = "A otimização máxima. Remove todas as estruturas do mapa e reduz drasticamente a qualidade gráfica do jogo ao mínimo. Ideal para computadores mais fracos. Ao desativar, tudo volta ao normal."
+OptUltraText.TextColor3 = Theme.TextDim
+OptUltraText.Font = Enum.Font.Gotham
+OptUltraText.TextSize = 12
+OptUltraText.TextXAlignment = Enum.TextXAlignment.Left
+OptUltraText.TextYAlignment = Enum.TextYAlignment.Top
+OptUltraText.TextWrapped = true
+OptUltraText.Parent = CardOptUltraDesc
 
 --// ==========================================
 --// UI PEQUENA (Botão 🎲)
@@ -865,6 +1092,10 @@ local function destroyScript()
     pcall(function() if SmallGui then SmallGui:Destroy() end end)
     restoreStructures()
     stopAntiAFK()
+    stopNoclip()
+    pcall(function()
+        settings().Rendering.QualityLevel = OriginalGraphics
+    end)
 end
 
 FloatingBtn.MouseEnter:Connect(function()
@@ -909,7 +1140,7 @@ tween(Main, {Size = CONFIG.UISize, Position = CONFIG.UIOffset}, 0.35, Enum.Easin
 pcall(function()
     StarterGui:SetCore("SendNotification", {
         Title = "RAMDOM HUB v" .. CONFIG.Version,
-        Text = "Anti-AFK ativado • Otimização normal",
+        Text = "Otimização Ultra adicionada!",
         Duration = 5,
     })
 end)
