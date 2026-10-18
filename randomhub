@@ -1,11 +1,12 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.45                    ║
-    ║ Combat, Home, Auto Farm, Auto Itens, Auto Wood Beta, Fps Boost, Config ║
+    ║                 RAMDOM HUB  v1.5                     ║
+    ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v1.45:
-      + Melhoria Fps Boost
+    v1.5:
+      + Auto Raid Adicionado
+      + Bugs Fix
 ]]
 
 --// Serviços
@@ -38,7 +39,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.45",
+    Version = "1.5",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -50,6 +51,7 @@ local ScreenGui, Main
 --// Toggles compartilhados
 local setAutoMiner, getAutoMiner
 local setAutoWood, getAutoWood
+local setAutoRaid, getAutoRaid
 local setLocateStructures, getLocateStructures
 
 --// ==========================================
@@ -85,6 +87,7 @@ local AutoMob = {
     SelectionVersion = 0,    
     HasSelection = nil,
     IsSelected = nil,
+    IsValidMob = nil,
     ToggleType = nil,
     ClearSelection = nil,
     RefreshUI = nil,
@@ -217,6 +220,21 @@ local AutoWood = {
     Start = nil,
     Stop = nil,
     Target = nil,
+}
+
+--// ==========================================
+--// AUTO RAID — ESTADO
+--// ==========================================
+local AutoRaid = {
+    Enabled = false,
+    Token = 0,
+    Thread = nil,
+    Start = nil,
+    Stop = nil,
+    Target = nil,
+    AimPosition = nil,
+    HoverHeight = 40, -- altura de teleporte acima do chão detectado
+    Status = "desligado",
 }
 
 --// ==========================================
@@ -719,6 +737,7 @@ do
         end
         return true
     end
+    AutoMob.IsValidMob = isValidMob
 
     local function mobKey(name)
         local raw = string.lower(tostring(name or ""))
@@ -4207,6 +4226,379 @@ do
 end
 
 --// ==========================================
+--// AUTO RAID — VOO ESTÁVEL E MIRA NO MOB MAIS PRÓXIMO
+--// ==========================================
+do
+    local STEER_NAME = "RamdomHubAutoRaidAim"
+    local activeRoot, activeHumanoid = nil, nil
+    local bodyPosition, bodyGyro = nil, nil
+    local orientationLockConnection = nil
+    local savedPlatformStand, savedAutoRotate = nil, nil
+    local hoverAnchor = nil
+    local targetGroundY = nil
+    local groundBaseY = nil
+    local appliedHoverHeight = nil
+    local currentHoverY = nil
+    local lastHoverUpdate = 0
+    local lastGroundScan, lastMobScan, lastMouseMove = 0, 0, 0
+    local cachedTargetDistance = math.huge
+
+    local function isActive(token)
+        return AutoRaid.Enabled and AutoRaid.Token == token
+    end
+
+    local function getCharacter()
+        local char = player.Character
+        if not char then return nil end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if hum and root and hum.Health > 0 then
+            return char, hum, root
+        end
+        return nil
+    end
+
+    local function getModelRoot(model)
+        if not model or not model.Parent then return nil end
+        return model:FindFirstChild("HumanoidRootPart")
+            or model.PrimaryPart
+            or model:FindFirstChild("UpperTorso")
+            or model:FindFirstChild("Torso")
+            or model:FindFirstChild("Head")
+            or model:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function isLivingTarget(model)
+        if not (model and model.Parent and model:IsDescendantOf(workspace)) then return false end
+        if model == player.Character or Players:GetPlayerFromCharacter(model) then return false end
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        return hum ~= nil and hum.Health > 0 and getModelRoot(model) ~= nil
+    end
+
+    local function getMobAimPosition(model)
+        -- A assistência deve mirar exclusivamente em mobs válidos do Auto Farm;
+        -- NPCs, jogadores e modelos vivos que não sejam mobs não são alvos de mira.
+        if not isLivingTarget(model) then return nil end
+        if not AutoMob.IsValidMob or not AutoMob.IsValidMob(model) then return nil end
+        local namedTorso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        if namedTorso and namedTorso:IsA("BasePart") then
+            return namedTorso.Position
+        end
+        local root = getModelRoot(model)
+        if root then
+            local ok, _, size = pcall(function()
+                local cf, bounds = model:GetBoundingBox()
+                return cf, bounds
+            end)
+            if ok and size and typeof(size) == "Vector3" then
+                return Vector3.new(root.Position.X, root.Position.Y + math.clamp(size.Y * 0.12, 1, 3), root.Position.Z)
+            end
+            return root.Position + Vector3.new(0, 1.5, 0)
+        end
+        return nil
+    end
+
+    -- Orienta o avatar deitado horizontalmente, com o rosto voltado para baixo.
+    -- O eixo da cabeça aponta horizontalmente na direção do mob; o eixo frontal
+    -- fica voltado para o chão, em vez de manter o personagem em pé.
+    local function getProneFacingCFrame(root, targetPosition)
+        if not (root and root.Parent) then return CFrame.new() end
+
+        local headDirection = Vector3.zero
+        if targetPosition then
+            headDirection = Vector3.new(
+                targetPosition.X - root.Position.X,
+                0,
+                targetPosition.Z - root.Position.Z
+            )
+        end
+
+        if headDirection.Magnitude < 0.05 then
+            local forward = root.CFrame.LookVector
+            headDirection = Vector3.new(forward.X, 0, forward.Z)
+        end
+        if headDirection.Magnitude < 0.05 then
+            headDirection = Vector3.new(0, 0, -1)
+        end
+
+        local faceDown = root.Position + Vector3.new(0, -1, 0)
+        return CFrame.lookAt(root.Position, faceDown, headDirection.Unit)
+    end
+
+    local function findGroundY(char, root)
+        if not (char and root) then return nil end
+        local filters = {char}
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.IgnoreWater = false
+        params.RespectCanCollide = true
+        local origin = root.Position + Vector3.new(0, 3, 0)
+        for _ = 1, 6 do
+            params.FilterDescendantsInstances = filters
+            local result = workspace:Raycast(origin, Vector3.new(0, -1500, 0), params)
+            if not result then return nil end
+            local hitModel = result.Instance and result.Instance:FindFirstAncestorOfClass("Model")
+            local hitHumanoid = hitModel and hitModel:FindFirstChildOfClass("Humanoid")
+            if hitHumanoid then
+                table.insert(filters, hitModel)
+            else
+                return result.Position.Y
+            end
+        end
+        return nil
+    end
+
+    local function removeHoverForces()
+        if bodyPosition then pcall(function() bodyPosition:Destroy() end) end
+        if bodyGyro then pcall(function() bodyGyro:Destroy() end) end
+        bodyPosition, bodyGyro = nil, nil
+
+        if activeHumanoid and activeHumanoid.Parent then
+            pcall(function()
+                if savedPlatformStand ~= nil then activeHumanoid.PlatformStand = savedPlatformStand end
+                if savedAutoRotate ~= nil then activeHumanoid.AutoRotate = savedAutoRotate end
+                if not activeHumanoid.PlatformStand then
+                    activeHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+                end
+            end)
+        end
+        activeRoot, activeHumanoid = nil, nil
+        savedPlatformStand, savedAutoRotate = nil, nil
+        hoverAnchor, targetGroundY, currentHoverY = nil, nil, nil
+        groundBaseY, appliedHoverHeight = nil, nil
+        lastHoverUpdate = 0
+    end
+
+    local function attachHover(char, hum, root)
+        removeHoverForces()
+        activeRoot, activeHumanoid = root, hum
+        savedPlatformStand = hum.PlatformStand
+        savedAutoRotate = hum.AutoRotate
+        local groundY = findGroundY(char, root)
+        groundBaseY = groundY or root.Position.Y
+        appliedHoverHeight = AutoRaid.HoverHeight
+        targetGroundY = groundBaseY + AutoRaid.HoverHeight
+
+        -- Teleporta imediatamente para a altura desejada, preservando orientação e posição horizontal.
+        local yOffset = targetGroundY - root.Position.Y
+        root.CFrame = root.CFrame + Vector3.new(0, yOffset, 0)
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        hoverAnchor = Vector3.new(root.Position.X, root.Position.Y, root.Position.Z)
+        currentHoverY = targetGroundY
+        lastHoverUpdate = os.clock()
+        lastGroundScan = lastHoverUpdate
+
+        local bp = Instance.new("BodyPosition")
+        bp.Name = "RamdomHubAutoRaidPosition"
+        bp.MaxForce = Vector3.new(1e8, 1e8, 1e8)
+        bp.P = 30000
+        bp.D = 1800
+        bp.Position = Vector3.new(hoverAnchor.X, currentHoverY, hoverAnchor.Z)
+        bp.Parent = root
+        bodyPosition = bp
+
+        local bg = Instance.new("BodyGyro")
+        bg.Name = "RamdomHubAutoRaidGyro"
+        bg.MaxTorque = Vector3.new(1e8, 1e8, 1e8)
+        bg.P = 18000
+        bg.D = 1200
+        bg.CFrame = getProneFacingCFrame(root, nil)
+        bg.Parent = root
+        bodyGyro = bg
+
+        pcall(function()
+            hum.AutoRotate = false
+            hum.PlatformStand = true
+            hum:ChangeState(Enum.HumanoidStateType.Physics)
+        end)
+    end
+
+    local function nearestMob(origin)
+        local best, bestDistance = nil, math.huge
+        -- Usa o mesmo filtro de mobs do Auto Farm e avalia cada instância individual.
+        for _, item in ipairs(workspace:GetDescendants()) do
+            if item:IsA("Humanoid") and item.Health > 0 then
+                local model = item.Parent
+                if model and model:IsA("Model") and AutoMob.IsValidMob
+                    and AutoMob.IsValidMob(model) then
+                    local targetRoot = getModelRoot(model)
+                    if targetRoot and model:IsDescendantOf(workspace) then
+                        local distance = (targetRoot.Position - origin).Magnitude
+                        if distance < bestDistance then
+                            best, bestDistance = model, distance
+                        end
+                    end
+                end
+            end
+        end
+        return best, bestDistance
+    end
+
+    -- Reaplica a orientação na fase de simulação física, não apenas no render.
+    -- Isso ajuda a impedir que skills que alteram o CFrame/rotação tirem o avatar da postura deitada.
+    local function enforceProneOrientation()
+        if not AutoRaid.Enabled or not (activeRoot and activeRoot.Parent) then return end
+
+        local aimPosition = getMobAimPosition(AutoRaid.Target)
+        AutoRaid.AimPosition = aimPosition
+        local lockedCFrame = getProneFacingCFrame(activeRoot, aimPosition)
+
+        if bodyGyro and bodyGyro.Parent == activeRoot then
+            bodyGyro.CFrame = lockedCFrame
+        end
+
+        pcall(function()
+            -- Mantém a posição atual, mas força a rotação deitada em cada passo físico.
+            activeRoot.CFrame = lockedCFrame
+            activeRoot.AssemblyAngularVelocity = Vector3.zero
+            if activeHumanoid and activeHumanoid.Parent then
+                activeHumanoid.AutoRotate = false
+                activeHumanoid.PlatformStand = true
+            end
+        end)
+    end
+
+    local function onRenderStep(dt)
+        if not AutoRaid.Enabled then return end
+        local model = AutoRaid.Target
+        local aimPosition = getMobAimPosition(model)
+        AutoRaid.AimPosition = aimPosition
+
+        -- Reforça a orientação também no render, para corrigir imediatamente a rotação
+        -- que algumas skills aplicam antes do próximo passo da simulação física.
+        if bodyGyro and activeRoot and activeRoot.Parent then
+            local lockedCFrame = getProneFacingCFrame(activeRoot, aimPosition)
+            bodyGyro.CFrame = lockedCFrame
+            pcall(function()
+                activeRoot.CFrame = lockedCFrame
+                activeRoot.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+        if not aimPosition then return end
+
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        local current = cam.CFrame
+        local desired = CFrame.lookAt(current.Position, aimPosition)
+        local alpha = math.clamp((dt or 1/60) * 16, 0, 1)
+        cam.CFrame = current:Lerp(desired, alpha)
+
+        -- Move o cursor para o ponto projetado do mob para habilidades que usam mouse.Hit/mouse.Target.
+        local now = os.clock()
+        if now - lastMouseMove >= 0.08 then
+            local screenPoint, onScreen = cam:WorldToViewportPoint(aimPosition)
+            if onScreen and screenPoint.Z > 0 then
+                pcall(function()
+                    VirtualInputManager:SendMouseMoveEvent(
+                        math.floor(screenPoint.X), math.floor(screenPoint.Y), game
+                    )
+                end)
+                lastMouseMove = now
+            end
+        end
+    end
+
+    local function startAutoRaid()
+        if AutoRaid.Enabled then return end
+        AutoRaid.Enabled = true
+        AutoRaid.Token = AutoRaid.Token + 1
+        local token = AutoRaid.Token
+        AutoRaid.Target = nil
+        AutoRaid.AimPosition = nil
+        cachedTargetDistance = math.huge
+        lastMobScan = 0
+        removeHoverForces()
+
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 2, onRenderStep)
+        if orientationLockConnection then
+            pcall(function() orientationLockConnection:Disconnect() end)
+            orientationLockConnection = nil
+        end
+        orientationLockConnection = RunService.PreSimulation:Connect(enforceProneOrientation)
+
+        AutoRaid.Thread = task.spawn(function()
+            while isActive(token) do
+                local char, hum, root = getCharacter()
+                if not (char and hum and root) then
+                    AutoRaid.Target = nil
+                    AutoRaid.AimPosition = nil
+                    task.wait(0.25)
+                else
+                    if activeRoot ~= root or not (bodyPosition and bodyPosition.Parent == root) then
+                        attachHover(char, hum, root)
+                        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+                        RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 2, onRenderStep)
+                    end
+
+                    local now = os.clock()
+                    -- Mantém a posição no ar e aplica alterações do slider Distância em tempo real.
+                    if bodyPosition and hoverAnchor and targetGroundY then
+                        if appliedHoverHeight ~= AutoRaid.HoverHeight then
+                            local refreshedGroundY = findGroundY(char, root)
+                            if refreshedGroundY then
+                                groundBaseY = refreshedGroundY
+                            end
+                            appliedHoverHeight = AutoRaid.HoverHeight
+                            targetGroundY = (groundBaseY or (root.Position.Y - AutoRaid.HoverHeight))
+                                + AutoRaid.HoverHeight
+                        end
+                        currentHoverY = targetGroundY
+                        bodyPosition.Position = Vector3.new(hoverAnchor.X, targetGroundY, hoverAnchor.Z)
+                    end
+
+                    if now - lastMobScan >= 0.8 then
+                        local candidate, candidateDistance = nearestMob(root.Position)
+                        local currentTarget = AutoRaid.Target
+                        local currentRoot = getModelRoot(currentTarget)
+                        local currentDistance = currentRoot and (currentRoot.Position - root.Position).Magnitude or math.huge
+                        -- Evita alternância rápida entre dois mobs quase à mesma distância.
+                        if candidate and (not isLivingTarget(currentTarget) or candidate == currentTarget
+                            or candidateDistance + 3 < currentDistance) then
+                            AutoRaid.Target = candidate
+                            cachedTargetDistance = candidateDistance
+                        elseif not isLivingTarget(currentTarget) then
+                            AutoRaid.Target = candidate
+                            cachedTargetDistance = candidateDistance
+                        else
+                            cachedTargetDistance = currentDistance
+                        end
+                        lastMobScan = now
+                    end
+                    task.wait(0.05)
+                end
+            end
+            AutoRaid.Thread = nil
+        end)
+    end
+
+    local function stopAutoRaid()
+        if not AutoRaid.Enabled and not bodyPosition and not bodyGyro then return end
+        AutoRaid.Enabled = false
+        AutoRaid.Token = AutoRaid.Token + 1
+        AutoRaid.Target = nil
+        AutoRaid.AimPosition = nil
+        if AutoRaid.Thread then
+            pcall(task.cancel, AutoRaid.Thread)
+            AutoRaid.Thread = nil
+        end
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        if orientationLockConnection then
+            pcall(function() orientationLockConnection:Disconnect() end)
+            orientationLockConnection = nil
+        end
+        removeHoverForces()
+    end
+
+    AutoRaid.Start = startAutoRaid
+    AutoRaid.Stop = stopAutoRaid
+end
+
+--// ==========================================
 --// COMBAT — MOTOR
 --// ==========================================
 do
@@ -4595,6 +4987,7 @@ local HomePage = createPage("Home")
 local CombatPage = createPage("Combat")
 local AutoMobsPage = createPage("AutoMobs")
 local AutoMinerPage = createPage("AutoMiner")
+local AutoRaidPage = createPage("AutoRaid")
 local ConfigPage = createPage("Config")
 
 do
@@ -4677,7 +5070,8 @@ createTabButton("Home", "Home", 1)
 createTabButton("Combat", "Combat", 2)
 createTabButton("AutoMobs", "Auto Farm", 3)
 createTabButton("AutoMiner", "Auto Itens", 4)
-createTabButton("Config", "Config", 5)
+createTabButton("AutoRaid", "Auto Raid", 5)
+createTabButton("Config", "Config", 6)
 
 local currentTab = nil
 local function setTab(id)
@@ -4798,7 +5192,7 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v1.45", "+ Melhoria Fps Boost", 100)
+createUpdateCard(HomePage, 2, "v1.5", "+ Auto Raid Adicionado\n+ Bugs Fix", 100)
 
 --// ==========================================
 --// ABA COMBAT
@@ -5058,6 +5452,7 @@ local setAutoMob, getAutoMob = createToggleCard(
     false,
     function(state)
         if state then
+            if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
             if getAutoMiner and getAutoMiner() then
                 setAutoMiner(false)
             end
@@ -5214,6 +5609,7 @@ setAutoMiner, getAutoMiner = createToggleCard(
     false,
     function(state)
         if state then
+            if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
             if getAutoMob and getAutoMob() then
                 setAutoMob(false)
             end
@@ -5234,6 +5630,7 @@ setAutoWood, getAutoWood = createToggleCard(
     false,
     function(state)
         if state then
+            if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
             if getAutoMob and getAutoMob() then
                 setAutoMob(false)
             end
@@ -5246,6 +5643,136 @@ setAutoWood, getAutoWood = createToggleCard(
         end
     end
 )
+
+
+--// ==========================================
+--// ABA AUTO RAID
+--// ==========================================
+setAutoRaid, getAutoRaid = createToggleCard(
+    AutoRaidPage,
+    1,
+    "Auto Raid",
+    false,
+    function(state)
+        if state then
+            -- Evita que os outros sistemas de deslocamento disputem o controle do personagem.
+            if getAutoMob and getAutoMob() then setAutoMob(false) end
+            if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
+            if getAutoWood and getAutoWood() then setAutoWood(false) end
+            AutoRaid.Start()
+        else
+            AutoRaid.Stop()
+        end
+    end
+)
+
+--// Controle de distância do Auto Raid (30 a 100 studs)
+local AutoRaidDistanceCard = Instance.new("Frame")
+AutoRaidDistanceCard.Name = "AutoRaidDistanceCard"
+AutoRaidDistanceCard.Size = UDim2.new(1, 0, 0, 88)
+AutoRaidDistanceCard.BackgroundColor3 = Theme.Card
+AutoRaidDistanceCard.BorderSizePixel = 0
+AutoRaidDistanceCard.LayoutOrder = 2
+AutoRaidDistanceCard.Parent = AutoRaidPage
+addCorner(AutoRaidDistanceCard, 14)
+addStroke(AutoRaidDistanceCard, Theme.Stroke, 1, 0.5)
+addGradient(AutoRaidDistanceCard, Theme.CardHover, Theme.Card, 90)
+
+local AutoRaidDistanceTitle = Instance.new("TextLabel")
+AutoRaidDistanceTitle.Name = "DistanceTitle"
+AutoRaidDistanceTitle.Size = UDim2.new(1, -32, 0, 22)
+AutoRaidDistanceTitle.Position = UDim2.new(0, 16, 0, 10)
+AutoRaidDistanceTitle.BackgroundTransparency = 1
+AutoRaidDistanceTitle.Text = "Distância: " .. tostring(AutoRaid.HoverHeight) .. " studs"
+AutoRaidDistanceTitle.TextColor3 = Theme.Text
+AutoRaidDistanceTitle.Font = Enum.Font.GothamBold
+AutoRaidDistanceTitle.TextSize = 13
+AutoRaidDistanceTitle.TextXAlignment = Enum.TextXAlignment.Left
+AutoRaidDistanceTitle.Parent = AutoRaidDistanceCard
+
+local AutoRaidDistanceBar = Instance.new("TextButton")
+AutoRaidDistanceBar.Name = "DistanceSlider"
+AutoRaidDistanceBar.Size = UDim2.new(1, -40, 0, 8)
+AutoRaidDistanceBar.Position = UDim2.new(0, 20, 0, 58)
+AutoRaidDistanceBar.BackgroundColor3 = Theme.TrackOff
+AutoRaidDistanceBar.BorderSizePixel = 0
+AutoRaidDistanceBar.Text = ""
+AutoRaidDistanceBar.AutoButtonColor = false
+AutoRaidDistanceBar.Active = true
+AutoRaidDistanceBar.Parent = AutoRaidDistanceCard
+addCorner(AutoRaidDistanceBar, 4)
+
+local AutoRaidDistanceFill = Instance.new("Frame")
+AutoRaidDistanceFill.Name = "DistanceFill"
+AutoRaidDistanceFill.Size = UDim2.new(0, 0, 1, 0)
+AutoRaidDistanceFill.BackgroundColor3 = Theme.Accent2
+AutoRaidDistanceFill.BorderSizePixel = 0
+AutoRaidDistanceFill.Active = false
+AutoRaidDistanceFill.Parent = AutoRaidDistanceBar
+addCorner(AutoRaidDistanceFill, 4)
+
+local AutoRaidDistanceKnob = Instance.new("Frame")
+AutoRaidDistanceKnob.Name = "DistanceKnob"
+AutoRaidDistanceKnob.Size = UDim2.fromOffset(16, 16)
+AutoRaidDistanceKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+AutoRaidDistanceKnob.Position = UDim2.new(0, 0, 0.5, 0)
+AutoRaidDistanceKnob.BackgroundColor3 = Theme.Text
+AutoRaidDistanceKnob.BorderSizePixel = 0
+AutoRaidDistanceKnob.Active = false
+AutoRaidDistanceKnob.Parent = AutoRaidDistanceBar
+addCorner(AutoRaidDistanceKnob, 8)
+addStroke(AutoRaidDistanceKnob, Theme.Accent1, 1, 0.1)
+
+local AUTO_RAID_DISTANCE_MIN = 30
+local AUTO_RAID_DISTANCE_MAX = 100
+local autoRaidDistanceDragging = false
+
+local function renderAutoRaidDistance()
+    local ratio = math.clamp(
+        (AutoRaid.HoverHeight - AUTO_RAID_DISTANCE_MIN)
+            / (AUTO_RAID_DISTANCE_MAX - AUTO_RAID_DISTANCE_MIN),
+        0, 1
+    )
+    AutoRaidDistanceTitle.Text = "Distância: " .. tostring(AutoRaid.HoverHeight) .. " studs"
+    AutoRaidDistanceFill.Size = UDim2.new(ratio, 0, 1, 0)
+    AutoRaidDistanceKnob.Position = UDim2.new(ratio, 0, 0.5, 0)
+end
+
+local function updateAutoRaidDistanceFromX(x)
+    local width = math.max(AutoRaidDistanceBar.AbsoluteSize.X, 1)
+    local ratio = math.clamp((x - AutoRaidDistanceBar.AbsolutePosition.X) / width, 0, 1)
+    AutoRaid.HoverHeight = math.clamp(
+        math.floor(AUTO_RAID_DISTANCE_MIN
+            + (AUTO_RAID_DISTANCE_MAX - AUTO_RAID_DISTANCE_MIN) * ratio + 0.5),
+        AUTO_RAID_DISTANCE_MIN, AUTO_RAID_DISTANCE_MAX
+    )
+    renderAutoRaidDistance()
+end
+
+AutoRaidDistanceBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        autoRaidDistanceDragging = true
+        updateAutoRaidDistanceFromX(input.Position.X)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if autoRaidDistanceDragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        updateAutoRaidDistanceFromX(input.Position.X)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        autoRaidDistanceDragging = false
+    end
+end)
+
+renderAutoRaidDistance()
+
 
 
 --// ==========================================
@@ -5920,6 +6447,7 @@ local function toggleUI()
 end
 
 local function destroyScript()
+    pcall(AutoRaid.Stop)
     pcall(AutoMob.Stop)
     pcall(AutoMiner.Stop)
     pcall(AutoWood.Stop)
