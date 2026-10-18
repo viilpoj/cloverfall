@@ -1,20 +1,12 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.3                     ║
-    ║ Combat, Home, Auto Farm, Auto Minner, Fps Boost, Config ║
+    ║                 RAMDOM HUB  v1.4                     ║
+    ║ Combat, Home, Auto Farm, Auto Itens, Auto Wood Beta, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v1.3:
-      + Auto Farm Melhorado (recuperação de obstáculo com timeout)
-      + Melhoria no Fps Boost
-      + Fps Boost NÃO diminui a distância de visão — agora vê o mapa inteiro
-        (FogEnd/FogStart altos + streaming máximo + qualidade alta)
-      + Fps Boost apaga tudo acima do chão instantaneamente
-      + Auto Equip: slots 1-0 selecionáveis sempre, mas só equipa com toggle ON
-      + Fps Boost movido para Config
-      + Noclip removido
-      + Status do Auto Miner removido da interface
-      + Info elegante abaixo de "Selecionar Alvo" e do Auto Miner
+    v1.4:
+      + Melhoria Auto Farm
+      + Adicionado Auto Wood (Auto Itens)
 ]]
 
 --// Serviços
@@ -47,7 +39,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.3",
+    Version = "1.4",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -58,6 +50,7 @@ local ScreenGui, Main
 
 --// Toggles compartilhados
 local setAutoMiner, getAutoMiner
+local setAutoWood, getAutoWood
 local setLocateStructures, getLocateStructures
 
 --// ==========================================
@@ -176,6 +169,60 @@ local AutoMiner = {
     Stop = nil,
     Target = nil,
     Collected = 0,
+}
+
+--// ==========================================
+--// AUTO WOOD — CONFIG E ESTADO
+--// ==========================================
+local WOOD_CFG = {
+    SearchRadius = 1500,
+    ArrivalDistance = 5.5,
+    ClickDelay = 0.45,
+    MaxClickAttempts = 50,
+    ScanDelay = 1.0,
+    WalkTimeout = 40,
+    IgnoreTime = 18,
+    CompletedIgnoreTime = 40,
+    WalkSpeedBonus = 7,
+
+    -- Filtro dimensional calibrado para aceitar também a árvore pequena da referência.
+    -- O nome precisa indicar árvore/wood e o objeto não pode parecer mobiliário/veículo.
+    MinTreeHeight = 5.0,
+    MinTreeWidth = 2.0,
+    MinTreeHeightWidthRatio = 0.45,
+    MaxTreeHeight = 55.0,
+    MaxTreeWidth = 45.0,
+
+    -- Verificação de progresso após o primeiro golpe de machado.
+    FirstHitVerifyDelay = 0.75,
+    CollectionNoticeVerifyDelay = 1.25,
+    ProgressSizeTolerance = 0.25,
+    ProgressRelativeTolerance = 0.035,
+    ProgressTransparencyTolerance = 0.07,
+    ProgressColorTolerance = 0.08,
+    NoProgressForwardDuration = 2.0,
+
+    -- Detecção de obstáculos e recuperação por pulos.
+    ObstacleRayDistance = 4.5,
+    ObstacleCheckInterval = 0.25,
+    JumpCooldown = 2.5,
+    JumpPressDuration = 0.04,
+    JumpPressInterval = 0.10,
+    PostJumpPause = 0.18,
+    MaxJumpSequencesPerWalk = 2,
+
+    -- Só pula se detectar bloqueio sólido e falta de avanço real.
+    StuckDetectDelay = 0.9,
+    StuckMovementThreshold = 0.55,
+}
+
+local AutoWood = {
+    Enabled = false,
+    Token = 0,
+    Thread = nil,
+    Start = nil,
+    Stop = nil,
+    Target = nil,
 }
 
 --// ==========================================
@@ -1514,7 +1561,7 @@ do
     local function normalizeName(name)
         local s = tostring(name or "")
         s = s:gsub("(%l)(%u)", "%1 %2")
-        s = s:gsub("[_%-%\.]+", " ")
+        s = s:gsub("[_.%-]+", " ")
         s = s:gsub("%s+", " ")
         return string.lower(s)
     end
@@ -3144,6 +3191,1174 @@ do
 end
 
 --// ==========================================
+--// AUTO WOOD — MOTOR
+--// Procura somente alvos com nomes de árvore/wood, caminha até eles e clica.
+--// ==========================================
+do
+    local PathfindingService = game:GetService("PathfindingService")
+    local STEER_NAME = "RamdomHubAutoWoodAim"
+    local ignored = setmetatable({}, { __mode = "k" })
+    local aimTarget = nil
+    local boostedHumanoid = nil
+    local originalWalkSpeed = nil
+    local forwardKeyDown = false
+    local spaceKeyDown = false
+    local lastObstacleJumpAt = -math.huge
+
+    local function isActive(token)
+        return AutoWood.Enabled and AutoWood.Token == token
+    end
+
+    local function getChar()
+        local char = player.Character
+        if not char then return nil end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if hum and root and hum.Health > 0 then
+            return char, hum, root
+        end
+        return nil
+    end
+
+    local function sendWoodKey(keyCode, down)
+        local ok = pcall(function()
+            VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
+        end)
+        if keyCode == Enum.KeyCode.W and ok then
+            forwardKeyDown = down
+        elseif keyCode == Enum.KeyCode.Space and ok then
+            spaceKeyDown = down
+        end
+    end
+
+    local function releaseWoodKeys()
+        -- Força a liberação mesmo se a rotina for cancelada durante uma espera.
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.W, false, game)
+        end)
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+        end)
+        forwardKeyDown = false
+        spaceKeyDown = false
+    end
+
+    local function releaseWoodMouse()
+        local p = getClickPosition() or Vector2.new(0, 0)
+        pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
+        end)
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            VirtualUser:Button1Up(p, cam and cam.CFrame or CFrame.new())
+        end)
+    end
+
+    local function normalizeName(name)
+        local s = tostring(name or "")
+        s = s:gsub("(%l)(%u)", "%1 %2")
+        s = s:gsub("[_%-%.]+", " ")
+        s = s:gsub("%s+", " ")
+        return string.lower(s):match("^%s*(.-)%s*$") or ""
+    end
+
+    -- Nomes de estruturas de madeira que não são árvores. Esses filtros são
+    -- aplicados antes das palavras positivas para não selecionar baús/carruagens,
+    -- tendas, móveis, paredes, caixas e outros props com madeira no nome.
+    local WOOD_EXCLUDED_NAME_HINTS = {
+        "chest", "coffer", "wagon", "cart", "carriage", "barrow", "vehicle",
+        "tent", "shelter", "camp", "cabin", "house", "shack", "shed",
+        "furniture", "chair", "table", "bench", "bed", "throne", "desk",
+        "crate", "box", "barrel", "cask", "container", "storage", "supply",
+        "treasure", "loot", "plank", "board", "wall", "fence", "gate", "door",
+        "bridge", "platform", "building", "structure", "barricade", "tower",
+        "boat", "ship", "raft", "pavilion", "altar", "coffin", "casket",
+        "wheel", "wheels", "axle", "decoration", "decor", "showcase", "display", "shop", "merchant",
+    }
+
+    local function isExcludedWoodName(name)
+        local s = normalizeName(name)
+        for _, hint in ipairs(WOOD_EXCLUDED_NAME_HINTS) do
+            if s:find("%f[%a]" .. hint .. "%f[%A]") then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function isWoodName(name)
+        local s = normalizeName(name)
+        if isExcludedWoodName(s) then return false end
+        if s:find("árvore", 1, true) or s:find("arvore", 1, true)
+            or s:find("madeira", 1, true) then
+            return true
+        end
+        local patterns = {
+            "%f[%a]trees?%f[%A]",
+            "%f[%a]wood%f[%A]",
+            "%f[%a]logs?%f[%A]",
+            "%f[%a]trunks?%f[%A]",
+        }
+        for _, pattern in ipairs(patterns) do
+            if s:find(pattern) then return true end
+        end
+        return false
+    end
+
+    -- Detecta a notificação do próprio jogo mostrada como "< Collected Wood >".
+    -- Funciona quando a mensagem é criada, seu texto muda ou a interface volta a ficar visível.
+    local collectionNoticeCount = 0
+    local collectionNoticeStates = setmetatable({}, { __mode = "k" })
+    local watchedTextObjects = setmetatable({}, { __mode = "k" })
+    local watchedVisibilityObjects = setmetatable({}, { __mode = "k" })
+    local watchedGuiContainers = setmetatable({}, { __mode = "k" })
+
+    local function isTextGuiObject(inst)
+        return inst and (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox"))
+    end
+
+    local function isGuiTreeVisible(inst)
+        local cur = inst
+        while cur and cur ~= game do
+            if cur:IsA("GuiObject") and not cur.Visible then
+                return false
+            end
+            if cur:IsA("LayerCollector") and not cur.Enabled then
+                return false
+            end
+            cur = cur.Parent
+        end
+        return true
+    end
+
+    local function isCollectedWoodMessage(value)
+        local text = normalizeName(value)
+        return text:find("collected%s+wood") ~= nil
+            or text:find("wood%s+collected") ~= nil
+            or text:find("madeira%s+coletada") ~= nil
+            or text:find("madeira%s+coletado") ~= nil
+    end
+
+    local function updateCollectionNoticeState(label, eventKind)
+        if not isTextGuiObject(label) then return end
+        local text = tostring(label.Text or "")
+        local visible = isGuiTreeVisible(label)
+        local matches = isCollectedWoodMessage(text)
+        local state = collectionNoticeStates[label]
+        local now = os.clock()
+
+        if not state then
+            state = { Text = text, Visible = visible, LastCountAt = -math.huge }
+            collectionNoticeStates[label] = state
+            -- Existing toast at script startup is baseline, not a new collection.
+            if eventKind == "added" and matches and visible then
+                collectionNoticeCount = collectionNoticeCount + 1
+                state.LastCountAt = now
+            end
+            return
+        end
+
+        local changed = text ~= state.Text or (visible and not state.Visible)
+        if eventKind == "added" and matches and visible then
+            changed = true
+        end
+        if matches and visible and changed and now - state.LastCountAt >= 0.25 then
+            collectionNoticeCount = collectionNoticeCount + 1
+            state.LastCountAt = now
+        end
+        state.Text = text
+        state.Visible = visible
+    end
+
+    local function scanCollectionNotices(container, eventKind)
+        if not container then return end
+        if isTextGuiObject(container) then
+            updateCollectionNoticeState(container, eventKind or "visibility")
+        end
+        local ok, descendants = pcall(function() return container:GetDescendants() end)
+        if not ok or not descendants then return end
+        for _, descendant in ipairs(descendants) do
+            if isTextGuiObject(descendant) then
+                updateCollectionNoticeState(descendant, eventKind or "visibility")
+            end
+        end
+    end
+
+    local function watchCollectionGuiObject(inst, eventKind)
+        if not inst then return end
+        if isTextGuiObject(inst) then
+            if not watchedTextObjects[inst] then
+                watchedTextObjects[inst] = true
+                pcall(function()
+                    inst:GetPropertyChangedSignal("Text"):Connect(function()
+                        updateCollectionNoticeState(inst, "changed")
+                    end)
+                end)
+            end
+            updateCollectionNoticeState(inst, eventKind or "initial")
+        end
+
+        if (inst:IsA("GuiObject") or inst:IsA("LayerCollector"))
+            and not watchedVisibilityObjects[inst] then
+            watchedVisibilityObjects[inst] = true
+            local propertyName = inst:IsA("LayerCollector") and "Enabled" or "Visible"
+            pcall(function()
+                inst:GetPropertyChangedSignal(propertyName):Connect(function()
+                    scanCollectionNotices(inst, "visibility")
+                end)
+            end)
+        end
+    end
+
+    local function watchCollectionGuiContainer(container)
+        if not container or watchedGuiContainers[container] then return end
+        watchedGuiContainers[container] = true
+        watchCollectionGuiObject(container, "initial")
+        local ok, descendants = pcall(function() return container:GetDescendants() end)
+        if ok and descendants then
+            for _, descendant in ipairs(descendants) do
+                watchCollectionGuiObject(descendant, "initial")
+            end
+        end
+        pcall(function()
+            container.DescendantAdded:Connect(function(descendant)
+                watchCollectionGuiObject(descendant, "added")
+                local okChildren, children = pcall(function() return descendant:GetDescendants() end)
+                if okChildren and children then
+                    for _, child in ipairs(children) do
+                        watchCollectionGuiObject(child, "added")
+                    end
+                end
+            end)
+        end)
+    end
+
+    -- A mensagem pode estar no PlayerGui ou em uma interface nativa do cliente.
+    pcall(function() watchCollectionGuiContainer(CoreGui) end)
+    local existingPlayerGui = player:FindFirstChildOfClass("PlayerGui")
+    if existingPlayerGui then
+        pcall(function() watchCollectionGuiContainer(existingPlayerGui) end)
+    end
+    player.ChildAdded:Connect(function(child)
+        if child:IsA("PlayerGui") then
+            pcall(function() watchCollectionGuiContainer(child) end)
+        end
+    end)
+
+    local TREE_COMPONENT_HINTS = {
+        "trunk", "branch", "branches", "leaf", "leaves", "foliage", "bark", "root",
+        "galho", "galhos", "folha", "folhas", "copa", "ramo", "ramos",
+    }
+
+    local function isTreeComponentName(name)
+        local s = normalizeName(name)
+        for _, hint in ipairs(TREE_COMPONENT_HINTS) do
+            if s == hint or s:find(hint, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function hasNamedWoodModelChild(inst)
+        if not inst:IsA("Model") then return false end
+        for _, child in ipairs(inst:GetChildren()) do
+            -- Um submodelo chamado Trunk/Leaves é uma peça da árvore, não outra árvore.
+            if child:IsA("Model") and isWoodName(child.Name)
+                and not isTreeComponentName(child.Name) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function hasWoodAncestor(inst)
+        local cur = inst.Parent
+        while cur and cur ~= workspace do
+            -- Se o Model parece ser apenas um agrupador de várias árvores, deixa
+            -- cada árvore filha virar um alvo separado.
+            if (cur:IsA("Model") or cur:IsA("BasePart")) and isWoodName(cur.Name)
+                and not hasNamedWoodModelChild(cur) then
+                return true
+            end
+            cur = cur.Parent
+        end
+        return false
+    end
+
+    local function hasLivingAncestor(inst)
+        local cur = inst
+        while cur and cur ~= workspace do
+            if cur:IsA("Model") and cur:FindFirstChildOfClass("Humanoid") then
+                return true
+            end
+            cur = cur.Parent
+        end
+        return false
+    end
+
+    local function collectParts(inst)
+        local parts = {}
+        if inst:IsA("BasePart") then
+            table.insert(parts, inst)
+        end
+        for _, d in ipairs(inst:GetDescendants()) do
+            if d:IsA("BasePart") then
+                table.insert(parts, d)
+            end
+        end
+        return parts
+    end
+
+    local function visiblePartCount(inst)
+        if not inst or not inst.Parent then return 0 end
+        local count = 0
+        for _, part in ipairs(collectParts(inst)) do
+            if part.Parent and part.Transparency < 0.98 then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
+    local function getTargetBox(inst)
+        if not inst or not inst.Parent then return nil end
+        if inst:IsA("BasePart") then
+            return inst.CFrame, inst.Size
+        end
+        local ok, cf, size = pcall(function()
+            return inst:GetBoundingBox()
+        end)
+        if ok and cf and size then
+            return cf, size
+        end
+
+        -- Fallback para modelos sem uma caixa de limites disponível.
+        local parts = collectParts(inst)
+        if #parts == 0 then return nil end
+        local minV = Vector3.new(math.huge, math.huge, math.huge)
+        local maxV = Vector3.new(-math.huge, -math.huge, -math.huge)
+        for _, part in ipairs(parts) do
+            local half = part.Size / 2
+            local p = part.Position
+            minV = Vector3.new(
+                math.min(minV.X, p.X - half.X),
+                math.min(minV.Y, p.Y - half.Y),
+                math.min(minV.Z, p.Z - half.Z)
+            )
+            maxV = Vector3.new(
+                math.max(maxV.X, p.X + half.X),
+                math.max(maxV.Y, p.Y + half.Y),
+                math.max(maxV.Z, p.Z + half.Z)
+            )
+        end
+        local center = (minV + maxV) / 2
+        return CFrame.new(center), maxV - minV
+    end
+
+    local function findTrunkPart(inst, boxCf, boxSize)
+        if not inst or not inst.Parent then return nil end
+        if not (boxCf and boxSize) then
+            boxCf, boxSize = getTargetBox(inst)
+        end
+        if not (boxCf and boxSize) then return nil end
+
+        -- Uma árvore que é uma única peça/mesh não tem uma peça de tronco filha.
+        -- A posição do alvo será deslocada para a parte inferior em getAimPosition.
+        if inst:IsA("BasePart") then
+            local horizontal = math.max(inst.Size.X, inst.Size.Z)
+            if inst.Size.Y >= 2.5 and inst.Size.Y >= horizontal * 0.60 then
+                return inst
+            end
+            return nil
+        end
+
+        local bottomY = boxCf.Position.Y - boxSize.Y / 2
+        local horizontalBox = math.max(math.max(boxSize.X, boxSize.Z), 1)
+        local heightBox = math.max(boxSize.Y, 0.01)
+        local best, bestScore = nil, -math.huge
+
+        for _, part in ipairs(collectParts(inst)) do
+            if part.Parent and part.Transparency < 0.98 then
+                local horizontal = math.max(part.Size.X, part.Size.Z)
+                local vertical = part.Size.Y
+                local partBottom = part.Position.Y - vertical / 2
+                local relativeBottom = (partBottom - bottomY) / heightBox
+
+                -- Aceita segmentos robustos de tronco próximos à base. O limite
+                -- inferior por altura exclui a maior parte dos galhos horizontais.
+                if vertical >= 2.0 and vertical >= horizontal * 0.68
+                    and relativeBottom >= -0.08 and relativeBottom <= 0.55 then
+                    local centerOffset = Vector3.new(
+                        part.Position.X - boxCf.Position.X, 0,
+                        part.Position.Z - boxCf.Position.Z
+                    ).Magnitude
+                    local radialOffset = math.clamp(centerOffset / horizontalBox, 0, 1.5)
+                    local lowerScore = 1 - math.clamp(relativeBottom, 0, 1)
+                    local verticalScore = math.min(vertical / math.max(horizontal, 0.1), 3)
+                    local partName = normalizeName(part.Name)
+                    local namedTrunkBonus = 0
+                    if partName:find("trunk", 1, true)
+                        or partName:find("stem", 1, true)
+                        or partName:find("log", 1, true)
+                        or partName:find("tronco", 1, true) then
+                        namedTrunkBonus = 0.8
+                    end
+
+                    -- Prioridade principal: segmento mais baixo; depois, peça mais
+                    -- central e vertical. Assim a mira não escolhe a ponta da copa.
+                    local score = lowerScore * 4.0
+                        + (1 - math.min(radialOffset, 1)) * 1.4
+                        + verticalScore * 0.15
+                        + namedTrunkBonus
+                    if score > bestScore then
+                        best, bestScore = part, score
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local function getAimPosition(inst)
+        local cf, size = getTargetBox(inst)
+        if not cf or not size then return nil end
+
+        -- Mira no primeiro segmento de tronco próximo à base, não na ponta da copa.
+        -- Recalcula o ponto a cada atualização para acompanhar a coleta.
+        local trunk = findTrunkPart(inst, cf, size)
+        if trunk and trunk.Parent then
+            local isWholeTreeMesh = trunk == inst
+                or (trunk.Size.Y >= size.Y * 0.85
+                    and math.max(trunk.Size.X, trunk.Size.Z)
+                        >= math.max(size.X, size.Z) * 0.75)
+            local aimY
+            if isWholeTreeMesh then
+                -- Mesh única: mira no terço inferior, onde fica o tronco.
+                aimY = trunk.Position.Y - math.clamp(trunk.Size.Y * 0.28, 1, 6)
+            else
+                -- Tronco dividido em segmentos: mira no centro inferior do primeiro.
+                aimY = trunk.Position.Y - math.clamp(trunk.Size.Y * 0.10, 0.25, 1.0)
+            end
+            return Vector3.new(trunk.Position.X, aimY, trunk.Position.Z), cf, size, trunk
+        end
+
+        -- Fallback para modelos sem uma peça vertical identificável: mantém a
+        -- mira no terço inferior da caixa, nunca no centro da copa.
+        local y = cf.Position.Y
+        if size.Y > 4 then
+            y = cf.Position.Y - size.Y * 0.28
+        end
+        return Vector3.new(cf.Position.X, y, cf.Position.Z), cf, size, nil
+    end
+
+    local function getVisualSnapshot(inst)
+        if not inst or not inst.Parent or not inst:IsDescendantOf(workspace) then
+            return nil
+        end
+
+        local parts = collectParts(inst)
+        local visibleCount, totalVolume = 0, 0
+        local totalTransparency, totalR, totalG, totalB, samples = 0, 0, 0, 0, 0
+
+        for _, part in ipairs(parts) do
+            if part.Parent then
+                local volume = math.max(0, part.Size.X) * math.max(0, part.Size.Y) * math.max(0, part.Size.Z)
+                totalVolume = totalVolume + volume
+                if part.Transparency < 0.98 then
+                    visibleCount = visibleCount + 1
+                    totalTransparency = totalTransparency + part.Transparency
+                    totalR = totalR + part.Color.R
+                    totalG = totalG + part.Color.G
+                    totalB = totalB + part.Color.B
+                    samples = samples + 1
+                end
+            end
+        end
+
+        local _, boxSize = getTargetBox(inst)
+        if not boxSize then return nil end
+        local divisor = math.max(samples, 1)
+        return {
+            VisibleCount = visibleCount,
+            PartCount = #parts,
+            Volume = totalVolume,
+            Size = boxSize,
+            Transparency = totalTransparency / divisor,
+            R = totalR / divisor,
+            G = totalG / divisor,
+            B = totalB / divisor,
+        }
+    end
+
+    -- A seleção de alvos usa somente os nomes dos objetos; não há fallback geométrico.
+
+    local function hasVisualProgress(before, after)
+        if not after or after.VisibleCount <= 0 then return true end
+        if not before then return false end
+        if after.VisibleCount < before.VisibleCount or after.PartCount < before.PartCount then
+            return true
+        end
+
+        local tol = WOOD_CFG.ProgressSizeTolerance
+        local rel = WOOD_CFG.ProgressRelativeTolerance
+        local function shrank(beforeValue, afterValue)
+            return beforeValue - afterValue >= math.max(tol, beforeValue * rel)
+        end
+
+        if shrank(before.Size.Y, after.Size.Y)
+            or shrank(before.Size.X, after.Size.X)
+            or shrank(before.Size.Z, after.Size.Z) then
+            return true
+        end
+        if before.Volume - after.Volume >= math.max(0.35, before.Volume * rel) then
+            return true
+        end
+        if after.Transparency - before.Transparency >= WOOD_CFG.ProgressTransparencyTolerance then
+            return true
+        end
+        if math.abs(after.R - before.R) >= WOOD_CFG.ProgressColorTolerance
+            or math.abs(after.G - before.G) >= WOOD_CFG.ProgressColorTolerance
+            or math.abs(after.B - before.B) >= WOOD_CFG.ProgressColorTolerance then
+            return true
+        end
+        return false
+    end
+
+    local function horizontalDistance(a, b)
+        return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+    end
+
+    local function setWalkSpeedBoost(enabled)
+        local _, hum = getChar()
+        if enabled then
+            if not hum then return end
+            if boostedHumanoid ~= hum then
+                if boostedHumanoid and boostedHumanoid.Parent and originalWalkSpeed then
+                    pcall(function() boostedHumanoid.WalkSpeed = originalWalkSpeed end)
+                end
+                boostedHumanoid = hum
+                originalWalkSpeed = hum.WalkSpeed
+            end
+            if originalWalkSpeed then
+                pcall(function() hum.WalkSpeed = originalWalkSpeed + WOOD_CFG.WalkSpeedBonus end)
+            end
+        else
+            if boostedHumanoid and boostedHumanoid.Parent and originalWalkSpeed then
+                pcall(function() boostedHumanoid.WalkSpeed = originalWalkSpeed end)
+            end
+            boostedHumanoid = nil
+            originalWalkSpeed = nil
+        end
+    end
+
+    local function getStandPoint(inst, hum, root)
+        local aimPos, cf, size, trunk = getAimPosition(inst)
+        if not (aimPos and cf and size) then return nil end
+
+        -- Usa o tronco para calcular a aproximação; a copa larga não deve fazer
+        -- o personagem parar vários metros antes de conseguir acertar com o machado.
+        local center = (trunk and trunk.Parent) and trunk.Position or aimPos
+        local toward = Vector3.new(root.Position.X - center.X, 0, root.Position.Z - center.Z)
+        if toward.Magnitude < 0.1 then
+            local look = root.CFrame.LookVector
+            toward = Vector3.new(look.X, 0, look.Z)
+        end
+        if toward.Magnitude < 0.1 then
+            toward = Vector3.new(1, 0, 0)
+        else
+            toward = toward.Unit
+        end
+
+        local radius
+        if trunk and trunk.Parent then
+            radius = math.clamp(math.max(trunk.Size.X, trunk.Size.Z) / 2, 1, 3.5)
+        else
+            radius = math.clamp(math.max(size.X, size.Z) / 2, 1, 5)
+        end
+        local offset = radius + 2.0
+        local x = center.X + toward.X * offset
+        local z = center.Z + toward.Z * offset
+        local destination = Vector3.new(x, root.Position.Y, z)
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { inst, player.Character }
+        params.RespectCanCollide = true
+        local hit = workspace:Raycast(
+            Vector3.new(x, math.max(root.Position.Y, cf.Position.Y) + 25, z),
+            Vector3.new(0, -120, 0),
+            params
+        )
+        if hit and hit.Normal.Y >= 0.45 then
+            destination = Vector3.new(
+                x,
+                hit.Position.Y + math.max(2, hum.HipHeight + root.Size.Y / 2),
+                z
+            )
+        end
+        return destination, aimPos, radius
+    end
+
+    local function getObstacleIdentity(part, target)
+        if not part then return nil end
+        local model = part:FindFirstAncestorOfClass("Model")
+        if model and model ~= target and not (target and model:IsDescendantOf(target)) then
+            return model
+        end
+        return part
+    end
+
+    local function getBlockingObstacle(root, direction, target)
+        if not root or not direction then return nil end
+        local flatDirection = Vector3.new(direction.X, 0, direction.Z)
+        if flatDirection.Magnitude < 0.1 then return nil end
+        flatDirection = flatDirection.Unit
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local filters = {}
+        if player.Character then table.insert(filters, player.Character) end
+        if target then table.insert(filters, target) end
+        params.FilterDescendantsInstances = filters
+        params.RespectCanCollide = true
+
+        local counts = {}
+        local centerHitIdentity = nil
+        local heights = { 0.35, 1.25, 2.15 }
+        for index, height in ipairs(heights) do
+            local origin = root.Position + Vector3.new(0, height, 0)
+            local hit = workspace:Raycast(origin, flatDirection * WOOD_CFG.ObstacleRayDistance, params)
+            if hit and hit.Instance and hit.Instance.CanCollide and hit.Distance >= 1.0 then
+                local identity = getObstacleIdentity(hit.Instance, target)
+                if identity then
+                    counts[identity] = (counts[identity] or 0) + 1
+                    if index == 2 then centerHitIdentity = identity end
+                end
+            end
+        end
+
+        local best, bestCount = nil, 0
+        for identity, count in pairs(counts) do
+            if count > bestCount then
+                best, bestCount = identity, count
+            end
+        end
+        -- Dois raios concordantes são evidência forte; o raio central também
+        -- pode confirmar um obstáculo sólido e próximo, como um poste estreito.
+        if best and bestCount >= 2 then return best end
+        if centerHitIdentity then return centerHitIdentity end
+        return nil
+    end
+
+    local function pressSpaceThreeTimes(token)
+        if not isActive(token) then return false end
+        if os.clock() - lastObstacleJumpAt < WOOD_CFG.JumpCooldown then return false end
+        lastObstacleJumpAt = os.clock()
+
+        for index = 1, 3 do
+            if not isActive(token) then
+                releaseWoodKeys()
+                return false
+            end
+            sendWoodKey(Enum.KeyCode.Space, true)
+            local pressedAt = os.clock()
+            while isActive(token) and os.clock() - pressedAt < WOOD_CFG.JumpPressDuration do
+                task.wait(0.01)
+            end
+            sendWoodKey(Enum.KeyCode.Space, false)
+            if not isActive(token) then
+                releaseWoodKeys()
+                return false
+            end
+            if index < 3 then
+                local gapUntil = os.clock() + WOOD_CFG.JumpPressInterval
+                while isActive(token) and os.clock() < gapUntil do
+                    task.wait(0.01)
+                end
+            end
+        end
+
+        local pauseUntil = os.clock() + WOOD_CFG.PostJumpPause
+        while isActive(token) and os.clock() < pauseUntil do
+            task.wait(0.02)
+        end
+        return isActive(token)
+    end
+
+    local function walkForwardRecovery(target, token)
+        local _, hum, root = getChar()
+        if not (hum and root) or not isActive(token) then return false end
+
+        setWalkSpeedBoost(true)
+        sendWoodKey(Enum.KeyCode.W, true)
+        local finishAt = os.clock() + WOOD_CFG.NoProgressForwardDuration
+        local nextObstacleCheck = 0
+        local jumpedFor = nil
+        local jumpSequences = 0
+        local lastProgressPos = root.Position
+        local lastProgressAt = os.clock()
+
+        while isActive(token) and os.clock() < finishAt do
+            local _, humNow, rootNow = getChar()
+            if not (humNow and rootNow) then break end
+            local now = os.clock()
+            if horizontalDistance(rootNow.Position, lastProgressPos) >= WOOD_CFG.StuckMovementThreshold then
+                lastProgressPos = rootNow.Position
+                lastProgressAt = now
+                jumpedFor = nil
+            end
+            if now >= nextObstacleCheck then
+                local cam = workspace.CurrentCamera
+                local forward = cam and cam.CFrame.LookVector or rootNow.CFrame.LookVector
+                local obstacle = getBlockingObstacle(rootNow, forward, target)
+                local stalled = now - lastProgressAt >= WOOD_CFG.StuckDetectDelay
+                if not obstacle then
+                    jumpedFor = nil
+                elseif stalled and obstacle ~= jumpedFor and jumpSequences < 1
+                    and now - lastObstacleJumpAt >= WOOD_CFG.JumpCooldown then
+                    if pressSpaceThreeTimes(token) then
+                        jumpedFor = obstacle
+                        jumpSequences = jumpSequences + 1
+                        lastProgressAt = os.clock()
+                        lastProgressPos = rootNow.Position
+                    end
+                end
+                nextObstacleCheck = os.clock() + WOOD_CFG.ObstacleCheckInterval
+            end
+            task.wait(0.05)
+        end
+
+        sendWoodKey(Enum.KeyCode.W, false)
+        setWalkSpeedBoost(false)
+        return isActive(token)
+    end
+
+    local function hasExcludedWoodAncestor(inst)
+        local cur = inst.Parent
+        while cur and cur ~= workspace do
+            if isExcludedWoodName(cur.Name) then
+                return true
+            end
+            cur = cur.Parent
+        end
+        return false
+    end
+
+    -- Confere a caixa de limites do alvo. Árvores precisam ter uma altura mínima,
+    -- alguma largura real e proporção vertical compatível com uma árvore/tronco.
+    -- A proporção deixa passar a árvore menor da referência, mas rejeita toras no
+    -- chão e muitos objetos largos/baixos, como caixas e carroças de madeira.
+    local function nameExplicitlySaysTree(name)
+        local s = normalizeName(name)
+        return s:find("%f[%a]trees?%f[%A]") ~= nil
+            or s:find("arvore", 1, true) ~= nil
+            or s:find("árvore", 1, true) ~= nil
+    end
+
+    local function hasExcludedWoodDescendant(inst)
+        if not inst:IsA("Model") then return false end
+        local ok, descendants = pcall(function() return inst:GetDescendants() end)
+        if not ok or not descendants then return false end
+        for _, descendant in ipairs(descendants) do
+            if (descendant:IsA("Model") or descendant:IsA("BasePart"))
+                and isExcludedWoodName(descendant.Name) then
+                -- Evita que um agrupador chamado apenas "Wood" vire alvo quando
+                -- na verdade ele contém um baú/carroça/tenda de decoração.
+                return true
+            end
+        end
+        return false
+    end
+
+    local function isTreeSizedTarget(inst)
+        local cf, size = getTargetBox(inst)
+        if not cf or not size then return false end
+        local height = size.Y
+        local width = math.max(size.X, size.Z)
+        if height < WOOD_CFG.MinTreeHeight or width < WOOD_CFG.MinTreeWidth then
+            return false
+        end
+        if height > WOOD_CFG.MaxTreeHeight or width > WOOD_CFG.MaxTreeWidth then
+            return false
+        end
+        if height / math.max(width, 0.01) < WOOD_CFG.MinTreeHeightWidthRatio then
+            return false
+        end
+
+        -- Objetos nomeados explicitamente como Tree/Árvore podem ser uma única
+        -- malha. Para nomes genéricos como Wood/Log, exige também uma peça vertical
+        -- na região central e inferior, reduzindo falsos positivos como carroças.
+        if nameExplicitlySaysTree(inst.Name) then
+            return true
+        end
+        local trunk = findTrunkPart(inst, cf, size)
+        if not trunk or not trunk.Parent then return false end
+        local centerOffset = Vector3.new(
+            trunk.Position.X - cf.Position.X, 0,
+            trunk.Position.Z - cf.Position.Z
+        ).Magnitude
+        return centerOffset <= math.max(width * 0.35, 1.25)
+    end
+
+    local function isValidWoodTarget(inst)
+        if not inst or not inst.Parent or not inst:IsDescendantOf(workspace) then return false end
+        if not (inst:IsA("Model") or inst:IsA("BasePart")) then return false end
+        local namedTarget = isWoodName(inst.Name) and not isTreeComponentName(inst.Name)
+        if not namedTarget then return false end
+        if hasWoodAncestor(inst) or hasLivingAncestor(inst) then return false end
+        if hasExcludedWoodAncestor(inst) or hasExcludedWoodDescendant(inst) then return false end
+        if hasNamedWoodModelChild(inst) then return false end
+        if inst:FindFirstAncestorOfClass("Tool") then return false end
+        if player.Character and (inst == player.Character or inst:IsDescendantOf(player.Character)) then
+            return false
+        end
+        if visiblePartCount(inst) <= 0 then return false end
+        return isTreeSizedTarget(inst)
+    end
+
+    local function findTarget(root, token)
+        local now = os.clock()
+        local best, bestDist = nil, WOOD_CFG.SearchRadius
+        local visited = 0
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            if not isActive(token) then return nil end
+            local candidateByName = (inst:IsA("Model") or inst:IsA("BasePart"))
+                and isWoodName(inst.Name) and not isTreeComponentName(inst.Name)
+            if candidateByName and isValidWoodTarget(inst) then
+                local ignoredUntil = ignored[inst]
+                if not ignoredUntil or ignoredUntil <= now then
+                    local cf = getTargetBox(inst)
+                    if cf then
+                        local dist = horizontalDistance(root.Position, cf.Position)
+                        if dist < bestDist then
+                            best, bestDist = inst, dist
+                        end
+                    end
+                end
+            end
+            visited = visited + 1
+            if visited % 600 == 0 then task.wait() end
+        end
+        return best
+    end
+
+    local function onRenderStep()
+        if not AutoWood.Enabled then return end
+        local target = AutoWood.Target
+        if target and target.Parent and target:IsDescendantOf(workspace) then
+            -- Atualiza o ponto em cada frame para manter a mira presa ao tronco,
+            -- mesmo quando a árvore muda de tamanho após um golpe.
+            local updatedAim = getAimPosition(target)
+            if updatedAim then aimTarget = updatedAim end
+        end
+        if not aimTarget then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        local direction = aimTarget - cam.CFrame.Position
+        if direction.Magnitude < 0.5 then return end
+        if cam.CFrame.LookVector:Dot(direction.Unit) > 0.9997 then return end
+        local up = math.abs(direction.Unit.Y) > 0.98 and Vector3.new(0, 0, -1) or Vector3.new(0, 1, 0)
+        local desired = CFrame.lookAt(cam.CFrame.Position, aimTarget, up)
+        -- Travamento forte e suave: mantém a árvore no centro sem oscilação brusca.
+        cam.CFrame = cam.CFrame:Lerp(desired, 0.72)
+    end
+
+    local function walkTo(inst, token)
+        local _, hum, root = getChar()
+        if not (hum and root) then return false end
+        local destination, aimPos = getStandPoint(inst, hum, root)
+        if not destination then return false end
+
+        local waypoints = nil
+        local pathOk, path = pcall(function()
+            local p = PathfindingService:CreatePath({
+                AgentRadius = 2,
+                AgentHeight = 5,
+                AgentCanJump = true,
+                WaypointSpacing = 4,
+            })
+            p:ComputeAsync(root.Position, destination)
+            return p
+        end)
+        if pathOk and path and path.Status == Enum.PathStatus.Success then
+            local okWps, wps = pcall(function() return path:GetWaypoints() end)
+            if okWps and wps and #wps > 0 then waypoints = wps end
+        end
+        if not waypoints then
+            waypoints = { { Position = destination, Action = Enum.PathWaypointAction.Walk } }
+        end
+
+        setWalkSpeedBoost(true)
+        local started = os.clock()
+        local function finish(success)
+            setWalkSpeedBoost(false)
+            return success
+        end
+
+        local jumpSequences = 0
+        local nextObstacleCheck = 0
+        local lastObstaclePart = nil
+        for _, waypoint in ipairs(waypoints) do
+            if not isActive(token) then return finish(false) end
+            if not inst.Parent or not inst:IsDescendantOf(workspace) then return finish(false) end
+            local _, currentHum, currentRoot = getChar()
+            if not (currentHum and currentRoot) then return finish(false) end
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                pcall(function() currentHum.Jump = true end)
+            end
+            currentHum:MoveTo(waypoint.Position)
+            local lastPos = currentRoot.Position
+            local lastProgressAt = os.clock()
+            local reached = false
+
+            while isActive(token) and os.clock() - started < WOOD_CFG.WalkTimeout do
+                if not inst.Parent or not inst:IsDescendantOf(workspace) then
+                    return finish(false)
+                end
+                local _, humNow, rootNow = getChar()
+                if not (humNow and rootNow) then return finish(false) end
+                local flatDist = horizontalDistance(rootNow.Position, waypoint.Position)
+                if flatDist <= 3.5 and math.abs(rootNow.Position.Y - waypoint.Position.Y) <= 8 then
+                    reached = true
+                    break
+                end
+                local now = os.clock()
+                if (rootNow.Position - lastPos).Magnitude >= WOOD_CFG.StuckMovementThreshold then
+                    lastPos = rootNow.Position
+                    lastProgressAt = now
+                    lastObstaclePart = nil
+                elseif now - lastProgressAt >= 4 then
+                    break
+                end
+
+                -- Só pula quando há bloqueio sólido à frente E o personagem parou
+                -- de avançar. A árvore-alvo fica excluída dos raycasts.
+                if now >= nextObstacleCheck then
+                    local direction = waypoint.Position - rootNow.Position
+                    local obstacle = getBlockingObstacle(rootNow, direction, inst)
+                    if not obstacle and now - lastProgressAt >= WOOD_CFG.StuckDetectDelay then
+                        obstacle = getBlockingObstacle(rootNow, rootNow.CFrame.LookVector, inst)
+                    end
+                    local stalled = now - lastProgressAt >= WOOD_CFG.StuckDetectDelay
+                    if not obstacle then
+                        lastObstaclePart = nil
+                    elseif stalled and obstacle ~= lastObstaclePart
+                        and jumpSequences < WOOD_CFG.MaxJumpSequencesPerWalk
+                        and now - lastObstacleJumpAt >= WOOD_CFG.JumpCooldown then
+                        if pressSpaceThreeTimes(token) then
+                            jumpSequences = jumpSequences + 1
+                            lastObstaclePart = obstacle
+                            lastPos = rootNow.Position
+                            lastProgressAt = os.clock()
+                        end
+                    end
+                    nextObstacleCheck = os.clock() + WOOD_CFG.ObstacleCheckInterval
+                end
+                task.wait(0.1)
+            end
+            if not reached then return finish(false) end
+        end
+
+        local _, finalHum, finalRoot = getChar()
+        local finalDest = nil
+        if finalHum and finalRoot then
+            finalDest = getStandPoint(inst, finalHum, finalRoot)
+        end
+        if finalRoot and finalDest and horizontalDistance(finalRoot.Position, finalDest) <= WOOD_CFG.ArrivalDistance then
+            return finish(true)
+        end
+        -- O fim do caminho pode variar um pouco da posição de parada calculada.
+        if finalRoot then
+            local currentAim, targetCf, targetSize = getAimPosition(inst)
+            if currentAim and targetCf and targetSize then
+                local radius = math.clamp(math.max(targetSize.X, targetSize.Z) / 2, 1, 10)
+                if horizontalDistance(finalRoot.Position, targetCf.Position) <= radius + WOOD_CFG.ArrivalDistance then
+                    return finish(true)
+                end
+            end
+        end
+        return finish(false)
+    end
+
+    local function performWoodHit(inst, token)
+        if not isActive(token) then return false, false end
+        local before = getVisualSnapshot(inst)
+        if not before then return true, true end
+
+        local aimPos = getAimPosition(inst)
+        if not aimPos then return true, true end
+        aimTarget = aimPos
+        local noticeBefore = collectionNoticeCount
+        pcall(function() clickOnce(true) end)
+
+        -- O aviso "Collected Wood" é a confirmação primária do jogo; também
+        -- comparamos as propriedades do objeto para reconhecer progresso visual.
+        local verifyDelay = math.max(WOOD_CFG.FirstHitVerifyDelay, WOOD_CFG.CollectionNoticeVerifyDelay)
+        local verifyUntil = os.clock() + verifyDelay
+        while isActive(token) and os.clock() < verifyUntil do
+            if collectionNoticeCount > noticeBefore then
+                return true, true
+            end
+            task.wait(0.05)
+        end
+        if not isActive(token) then return false, false end
+        if collectionNoticeCount > noticeBefore then return true, true end
+
+        local after = getVisualSnapshot(inst)
+        if not after or after.VisibleCount <= 0 then
+            return true, true
+        end
+        return hasVisualProgress(before, after), false
+    end
+
+    local function clickWood(inst, token)
+        local attempts = 0
+        local completed = false
+
+        -- Primeiro golpe: guarda o estado visual antes de clicar e compara depois.
+        local progressed, gone = performWoodHit(inst, token)
+        attempts = attempts + 1
+        if gone then
+            completed = true
+        elseif isActive(token) and not progressed then
+            -- Uma única recuperação por árvore: avança por cerca de 2 segundos e
+            -- verifica novamente o mesmo alvo. Não repete o avanço se já há progresso.
+            if walkForwardRecovery(inst, token) and isActive(token) then
+                local _, _, root = getChar()
+                if root and inst.Parent and inst:IsDescendantOf(workspace) then
+                    local aimPos = getAimPosition(inst)
+                    if aimPos then aimTarget = aimPos end
+                    local progressedAgain, goneAgain = performWoodHit(inst, token)
+                    attempts = attempts + 1
+                    if goneAgain then
+                        completed = true
+                    end
+                else
+                    completed = true
+                end
+            end
+        end
+
+        while isActive(token) and not completed and attempts < WOOD_CFG.MaxClickAttempts do
+            if not inst.Parent or not inst:IsDescendantOf(workspace) or visiblePartCount(inst) <= 0 then
+                completed = true
+                break
+            end
+
+            local aimPos = getAimPosition(inst)
+            local noticeBefore = collectionNoticeCount
+            if aimPos then
+                aimTarget = aimPos
+                pcall(function() clickOnce(true) end)
+            end
+            attempts = attempts + 1
+            local clickWaitUntil = os.clock() + WOOD_CFG.ClickDelay
+            while isActive(token) and os.clock() < clickWaitUntil do
+                if collectionNoticeCount > noticeBefore then
+                    completed = true
+                    break
+                end
+                task.wait(0.05)
+            end
+            if collectionNoticeCount > noticeBefore then completed = true end
+        end
+
+        aimTarget = nil
+        if not isActive(token) then return end
+        if completed then
+            ignored[inst] = os.clock() + WOOD_CFG.CompletedIgnoreTime
+        elseif inst and inst.Parent then
+            ignored[inst] = os.clock() + WOOD_CFG.IgnoreTime
+        end
+    end
+
+    local function step(token)
+        if AutoMiner.Enabled or AutoMob.Enabled then
+            task.wait(0.3)
+            return
+        end
+        local _, _, root = getChar()
+        if not root then
+            AutoWood.Target = nil
+            aimTarget = nil
+            task.wait(0.5)
+            return
+        end
+
+        local target = findTarget(root, token)
+        if not target or not isActive(token) then
+            task.wait(WOOD_CFG.ScanDelay)
+            return
+        end
+
+        AutoWood.Target = target
+        local arrived = walkTo(target, token)
+        if arrived and isActive(token) and target.Parent and target:IsDescendantOf(workspace) then
+            clickWood(target, token)
+        elseif target and target.Parent then
+            ignored[target] = os.clock() + WOOD_CFG.IgnoreTime
+        end
+        aimTarget = nil
+        AutoWood.Target = nil
+        task.wait(0.15)
+    end
+
+    local function startAutoWood()
+        if AutoWood.Enabled then return end
+        AutoWood.Enabled = true
+        AutoWood.Token = AutoWood.Token + 1
+        local token = AutoWood.Token
+        for target in pairs(ignored) do ignored[target] = nil end
+        aimTarget = nil
+        lastObstacleJumpAt = -math.huge
+        releaseWoodKeys()
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 1, onRenderStep)
+
+        AutoWood.Thread = task.spawn(function()
+            while isActive(token) do
+                local ok, err = pcall(step, token)
+                if not ok then
+                    warn("[RAMDOM HUB] Auto Wood erro: " .. tostring(err))
+                    aimTarget = nil
+                    AutoWood.Target = nil
+                    releaseWoodKeys()
+                    releaseWoodMouse()
+                    setWalkSpeedBoost(false)
+                    task.wait(1.5)
+                end
+                task.wait(0.05)
+            end
+        end)
+    end
+
+    local function stopAutoWood()
+        if not AutoWood.Enabled then return end
+        AutoWood.Enabled = false
+        AutoWood.Token = AutoWood.Token + 1
+        -- Libera imediatamente os inputs antes de cancelar qualquer rotina suspensa.
+        releaseWoodKeys()
+        releaseWoodMouse()
+        if AutoWood.Thread then
+            pcall(task.cancel, AutoWood.Thread)
+            AutoWood.Thread = nil
+        end
+        AutoWood.Target = nil
+        aimTarget = nil
+        setWalkSpeedBoost(false)
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        local _, hum, root = getChar()
+        if hum and root then
+            pcall(function() hum:MoveTo(root.Position) end)
+        end
+    end
+
+    AutoWood.Start = startAutoWood
+    AutoWood.Stop = stopAutoWood
+end
+
+--// ==========================================
 --// COMBAT — MOTOR
 --// ==========================================
 do
@@ -3613,7 +4828,7 @@ end
 createTabButton("Home", "Home", 1)
 createTabButton("Combat", "Combat", 2)
 createTabButton("AutoMobs", "Auto Farm", 3)
-createTabButton("AutoMiner", "Auto Minner", 4)
+createTabButton("AutoMiner", "Auto Itens", 4)
 createTabButton("Config", "Config", 5)
 
 local currentTab = nil
@@ -3735,7 +4950,7 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v1.3", "+ Melhoria no Auto Farm\n+ Melhoria no Fps Boost", 100)
+createUpdateCard(HomePage, 2, "v1.4", "+ Melhoria Auto Farm\n+ Adicionado Auto Wood (Auto Itens)", 100)
 
 --// ==========================================
 --// ABA COMBAT
@@ -3998,6 +5213,9 @@ local setAutoMob, getAutoMob = createToggleCard(
             if getAutoMiner and getAutoMiner() then
                 setAutoMiner(false)
             end
+            if getAutoWood and getAutoWood() then
+                setAutoWood(false)
+            end
             AutoMob.Start()
         else
             AutoMob.Stop()
@@ -4059,40 +5277,10 @@ do
     addCorner(ClearBtn, 6)
     addGradient(ClearBtn, Theme.Accent2, Theme.Accent1, 0)
 
-    local MobInfo = Instance.new("Frame")
-    MobInfo.Name = "MobInfo"
-    MobInfo.Size = UDim2.new(1, -32, 0, 36)
-    MobInfo.Position = UDim2.new(0, 16, 0, 42)
-    MobInfo.BackgroundColor3 = Theme.BgSecondary
-    MobInfo.BackgroundTransparency = 0.25
-    MobInfo.BorderSizePixel = 0
-    MobInfo.Parent = MobSelectCard
-    addCorner(MobInfo, 8)
-
-    local MobInfoAccent = Instance.new("Frame")
-    MobInfoAccent.Size = UDim2.new(0, 3, 1, -12)
-    MobInfoAccent.Position = UDim2.new(0, 8, 0, 6)
-    MobInfoAccent.BackgroundColor3 = Theme.Accent2
-    MobInfoAccent.BorderSizePixel = 0
-    MobInfoAccent.Parent = MobInfo
-    addCorner(MobInfoAccent, 2)
-
-    local MobInfoText = Instance.new("TextLabel")
-    MobInfoText.Size = UDim2.new(1, -30, 1, 0)
-    MobInfoText.Position = UDim2.new(0, 20, 0, 0)
-    MobInfoText.BackgroundTransparency = 1
-    MobInfoText.Text = "Selecione um tipo de mob na lista; o Auto Farm procura pelo mapa e vai até ele mesmo de longe."
-    MobInfoText.TextColor3 = Theme.TextDim
-    MobInfoText.Font = Enum.Font.Gotham
-    MobInfoText.TextSize = 11
-    MobInfoText.TextXAlignment = Enum.TextXAlignment.Left
-    MobInfoText.TextYAlignment = Enum.TextYAlignment.Center
-    MobInfoText.TextWrapped = true
-    MobInfoText.Parent = MobInfo
 
     local MobScroll = Instance.new("ScrollingFrame")
-    MobScroll.Size = UDim2.new(1, -32, 1, -100)
-    MobScroll.Position = UDim2.new(0, 16, 0, 86)
+    MobScroll.Size = UDim2.new(1, -32, 1, -62)
+    MobScroll.Position = UDim2.new(0, 16, 0, 48)
     MobScroll.BackgroundTransparency = 1
     MobScroll.BorderSizePixel = 0
     MobScroll.ScrollBarThickness = 4
@@ -4168,7 +5356,7 @@ do
 end
 
 --// ==========================================
---// ABA AUTO MINNER
+--// ABA AUTO ITENS
 --// ==========================================
 
 setAutoMiner, getAutoMiner = createToggleCard(
@@ -4181,6 +5369,9 @@ setAutoMiner, getAutoMiner = createToggleCard(
             if getAutoMob and getAutoMob() then
                 setAutoMob(false)
             end
+            if getAutoWood and getAutoWood() then
+                setAutoWood(false)
+            end
             AutoMiner.Start()
         else
             AutoMiner.Stop()
@@ -4188,48 +5379,26 @@ setAutoMiner, getAutoMiner = createToggleCard(
     end
 )
 
-local MinerInfoCard = Instance.new("Frame")
-MinerInfoCard.Name = "MinerInfoCard"
-MinerInfoCard.Size = UDim2.new(1, 0, 0, 68)
-MinerInfoCard.BackgroundColor3 = Theme.Card
-MinerInfoCard.BorderSizePixel = 0
-MinerInfoCard.LayoutOrder = 2
-MinerInfoCard.Parent = AutoMinerPage
-addCorner(MinerInfoCard, 14)
-addStroke(MinerInfoCard, Theme.Stroke, 1, 0.5)
-addGradient(MinerInfoCard, Theme.CardHover, Theme.Card, 90)
+setAutoWood, getAutoWood = createToggleCard(
+    AutoMinerPage,
+    2,
+    "Auto Wood (Beta)",
+    false,
+    function(state)
+        if state then
+            if getAutoMob and getAutoMob() then
+                setAutoMob(false)
+            end
+            if getAutoMiner and getAutoMiner() then
+                setAutoMiner(false)
+            end
+            AutoWood.Start()
+        else
+            AutoWood.Stop()
+        end
+    end
+)
 
-local MinerInfoAccent = Instance.new("Frame")
-MinerInfoAccent.Size = UDim2.new(0, 3, 1, -20)
-MinerInfoAccent.Position = UDim2.new(0, 12, 0, 10)
-MinerInfoAccent.BackgroundColor3 = Theme.Accent2
-MinerInfoAccent.BorderSizePixel = 0
-MinerInfoAccent.Parent = MinerInfoCard
-addCorner(MinerInfoAccent, 2)
-
-local MinerInfoIcon = Instance.new("TextLabel")
-MinerInfoIcon.Size = UDim2.new(0, 22, 0, 22)
-MinerInfoIcon.Position = UDim2.new(0, 22, 0, 10)
-MinerInfoIcon.BackgroundTransparency = 1
-MinerInfoIcon.Text = "ℹ"
-MinerInfoIcon.TextColor3 = Theme.Accent2
-MinerInfoIcon.Font = Enum.Font.GothamBold
-MinerInfoIcon.TextSize = 18
-MinerInfoIcon.TextXAlignment = Enum.TextXAlignment.Center
-MinerInfoIcon.Parent = MinerInfoCard
-
-local MinerInfoText = Instance.new("TextLabel")
-MinerInfoText.Size = UDim2.new(1, -60, 1, -16)
-MinerInfoText.Position = UDim2.new(0, 48, 0, 8)
-MinerInfoText.BackgroundTransparency = 1
-MinerInfoText.Text = "Entre na caverna dos ores e ative a opção. Ocasionalmente o Auto Miner pode ficar instável por alguns segundos, mas ele retoma o funcionamento automaticamente."
-MinerInfoText.TextColor3 = Theme.TextDim
-MinerInfoText.Font = Enum.Font.Gotham
-MinerInfoText.TextSize = 11
-MinerInfoText.TextXAlignment = Enum.TextXAlignment.Left
-MinerInfoText.TextYAlignment = Enum.TextYAlignment.Top
-MinerInfoText.TextWrapped = true
-MinerInfoText.Parent = MinerInfoCard
 
 --// ==========================================
 --// CONFIG (+ Fps Boost)
@@ -4811,6 +5980,7 @@ end
 local function destroyScript()
     pcall(AutoMob.Stop)
     pcall(AutoMiner.Stop)
+    pcall(AutoWood.Stop)
     if _G.CombatToggleAttack then _G.CombatToggleAttack(false) end
     if _G.CombatToggleSkill then _G.CombatToggleSkill(false) end
     if _G.CombatToggleEquip then _G.CombatToggleEquip(false) end
