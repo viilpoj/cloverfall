@@ -1,12 +1,12 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.5                     ║
+    ║                 RAMDOM HUB  v1.6                     ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v1.5:
-      + Auto Raid Adicionado
-      + Bugs Fix
+    v1.6:
+      + Melhoria no Auto Raid
+      + Adicionado Performance de VFX (Reduz a Qualidade do VFX)
 ]]
 
 --// Serviços
@@ -39,7 +39,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.5",
+    Version = "1.6",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -4225,11 +4225,10 @@ do
     AutoWood.Stop = stopAutoWood
 end
 
---// ==========================================
---// AUTO RAID — VOO ESTÁVEL E MIRA NO MOB MAIS PRÓXIMO
+--// AUTO RAID — VOO ESTÁVEL (SEM ASSISTÊNCIA DE MIRA INTEGRADA)
 --// ==========================================
 do
-    local STEER_NAME = "RamdomHubAutoRaidAim"
+    local STEER_NAME = "RamdomHubAutoRaidPoseLock"
     local activeRoot, activeHumanoid = nil, nil
     local bodyPosition, bodyGyro = nil, nil
     local orientationLockConnection = nil
@@ -4239,9 +4238,7 @@ do
     local groundBaseY = nil
     local appliedHoverHeight = nil
     local currentHoverY = nil
-    local lastHoverUpdate = 0
-    local lastGroundScan, lastMobScan, lastMouseMove = 0, 0, 0
-    local cachedTargetDistance = math.huge
+    local lastGroundScan = 0
 
     local function isActive(token)
         return AutoRaid.Enabled and AutoRaid.Token == token
@@ -4258,69 +4255,14 @@ do
         return nil
     end
 
-    local function getModelRoot(model)
-        if not model or not model.Parent then return nil end
-        return model:FindFirstChild("HumanoidRootPart")
-            or model.PrimaryPart
-            or model:FindFirstChild("UpperTorso")
-            or model:FindFirstChild("Torso")
-            or model:FindFirstChild("Head")
-            or model:FindFirstChildWhichIsA("BasePart", true)
-    end
-
-    local function isLivingTarget(model)
-        if not (model and model.Parent and model:IsDescendantOf(workspace)) then return false end
-        if model == player.Character or Players:GetPlayerFromCharacter(model) then return false end
-        local hum = model:FindFirstChildOfClass("Humanoid")
-        return hum ~= nil and hum.Health > 0 and getModelRoot(model) ~= nil
-    end
-
-    local function getMobAimPosition(model)
-        -- A assistência deve mirar exclusivamente em mobs válidos do Auto Farm;
-        -- NPCs, jogadores e modelos vivos que não sejam mobs não são alvos de mira.
-        if not isLivingTarget(model) then return nil end
-        if not AutoMob.IsValidMob or not AutoMob.IsValidMob(model) then return nil end
-        local namedTorso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
-        if namedTorso and namedTorso:IsA("BasePart") then
-            return namedTorso.Position
-        end
-        local root = getModelRoot(model)
-        if root then
-            local ok, _, size = pcall(function()
-                local cf, bounds = model:GetBoundingBox()
-                return cf, bounds
-            end)
-            if ok and size and typeof(size) == "Vector3" then
-                return Vector3.new(root.Position.X, root.Position.Y + math.clamp(size.Y * 0.12, 1, 3), root.Position.Z)
-            end
-            return root.Position + Vector3.new(0, 1.5, 0)
-        end
-        return nil
-    end
-
-    -- Orienta o avatar deitado horizontalmente, com o rosto voltado para baixo.
-    -- O eixo da cabeça aponta horizontalmente na direção do mob; o eixo frontal
-    -- fica voltado para o chão, em vez de manter o personagem em pé.
-    local function getProneFacingCFrame(root, targetPosition)
+    -- Mantém o personagem deitado e voltado para baixo sem depender do alvo de mira.
+    local function getProneFacingCFrame(root)
         if not (root and root.Parent) then return CFrame.new() end
-
-        local headDirection = Vector3.zero
-        if targetPosition then
-            headDirection = Vector3.new(
-                targetPosition.X - root.Position.X,
-                0,
-                targetPosition.Z - root.Position.Z
-            )
-        end
-
-        if headDirection.Magnitude < 0.05 then
-            local forward = root.CFrame.LookVector
-            headDirection = Vector3.new(forward.X, 0, forward.Z)
-        end
+        local forward = root.CFrame.LookVector
+        local headDirection = Vector3.new(forward.X, 0, forward.Z)
         if headDirection.Magnitude < 0.05 then
             headDirection = Vector3.new(0, 0, -1)
         end
-
         local faceDown = root.Position + Vector3.new(0, -1, 0)
         return CFrame.lookAt(root.Position, faceDown, headDirection.Unit)
     end
@@ -4366,7 +4308,7 @@ do
         savedPlatformStand, savedAutoRotate = nil, nil
         hoverAnchor, targetGroundY, currentHoverY = nil, nil, nil
         groundBaseY, appliedHoverHeight = nil, nil
-        lastHoverUpdate = 0
+        lastGroundScan = 0
     end
 
     local function attachHover(char, hum, root)
@@ -4379,7 +4321,7 @@ do
         appliedHoverHeight = AutoRaid.HoverHeight
         targetGroundY = groundBaseY + AutoRaid.HoverHeight
 
-        -- Teleporta imediatamente para a altura desejada, preservando orientação e posição horizontal.
+        -- Teleporta para a altura selecionada, mantendo a posição horizontal.
         local yOffset = targetGroundY - root.Position.Y
         root.CFrame = root.CFrame + Vector3.new(0, yOffset, 0)
         pcall(function()
@@ -4389,8 +4331,7 @@ do
 
         hoverAnchor = Vector3.new(root.Position.X, root.Position.Y, root.Position.Z)
         currentHoverY = targetGroundY
-        lastHoverUpdate = os.clock()
-        lastGroundScan = lastHoverUpdate
+        lastGroundScan = os.clock()
 
         local bp = Instance.new("BodyPosition")
         bp.Name = "RamdomHubAutoRaidPosition"
@@ -4406,7 +4347,7 @@ do
         bg.MaxTorque = Vector3.new(1e8, 1e8, 1e8)
         bg.P = 18000
         bg.D = 1200
-        bg.CFrame = getProneFacingCFrame(root, nil)
+        bg.CFrame = getProneFacingCFrame(root)
         bg.Parent = root
         bodyGyro = bg
 
@@ -4417,42 +4358,13 @@ do
         end)
     end
 
-    local function nearestMob(origin)
-        local best, bestDistance = nil, math.huge
-        -- Usa o mesmo filtro de mobs do Auto Farm e avalia cada instância individual.
-        for _, item in ipairs(workspace:GetDescendants()) do
-            if item:IsA("Humanoid") and item.Health > 0 then
-                local model = item.Parent
-                if model and model:IsA("Model") and AutoMob.IsValidMob
-                    and AutoMob.IsValidMob(model) then
-                    local targetRoot = getModelRoot(model)
-                    if targetRoot and model:IsDescendantOf(workspace) then
-                        local distance = (targetRoot.Position - origin).Magnitude
-                        if distance < bestDistance then
-                            best, bestDistance = model, distance
-                        end
-                    end
-                end
-            end
-        end
-        return best, bestDistance
-    end
-
-    -- Reaplica a orientação na fase de simulação física, não apenas no render.
-    -- Isso ajuda a impedir que skills que alteram o CFrame/rotação tirem o avatar da postura deitada.
     local function enforceProneOrientation()
         if not AutoRaid.Enabled or not (activeRoot and activeRoot.Parent) then return end
-
-        local aimPosition = getMobAimPosition(AutoRaid.Target)
-        AutoRaid.AimPosition = aimPosition
-        local lockedCFrame = getProneFacingCFrame(activeRoot, aimPosition)
-
+        local lockedCFrame = getProneFacingCFrame(activeRoot)
         if bodyGyro and bodyGyro.Parent == activeRoot then
             bodyGyro.CFrame = lockedCFrame
         end
-
         pcall(function()
-            -- Mantém a posição atual, mas força a rotação deitada em cada passo físico.
             activeRoot.CFrame = lockedCFrame
             activeRoot.AssemblyAngularVelocity = Vector3.zero
             if activeHumanoid and activeHumanoid.Parent then
@@ -4462,43 +4374,9 @@ do
         end)
     end
 
-    local function onRenderStep(dt)
-        if not AutoRaid.Enabled then return end
-        local model = AutoRaid.Target
-        local aimPosition = getMobAimPosition(model)
-        AutoRaid.AimPosition = aimPosition
-
-        -- Reforça a orientação também no render, para corrigir imediatamente a rotação
-        -- que algumas skills aplicam antes do próximo passo da simulação física.
-        if bodyGyro and activeRoot and activeRoot.Parent then
-            local lockedCFrame = getProneFacingCFrame(activeRoot, aimPosition)
-            bodyGyro.CFrame = lockedCFrame
-            pcall(function()
-                activeRoot.CFrame = lockedCFrame
-                activeRoot.AssemblyAngularVelocity = Vector3.zero
-            end)
-        end
-        if not aimPosition then return end
-
-        local cam = workspace.CurrentCamera
-        if not cam then return end
-        local current = cam.CFrame
-        local desired = CFrame.lookAt(current.Position, aimPosition)
-        local alpha = math.clamp((dt or 1/60) * 16, 0, 1)
-        cam.CFrame = current:Lerp(desired, alpha)
-
-        -- Move o cursor para o ponto projetado do mob para habilidades que usam mouse.Hit/mouse.Target.
-        local now = os.clock()
-        if now - lastMouseMove >= 0.08 then
-            local screenPoint, onScreen = cam:WorldToViewportPoint(aimPosition)
-            if onScreen and screenPoint.Z > 0 then
-                pcall(function()
-                    VirtualInputManager:SendMouseMoveEvent(
-                        math.floor(screenPoint.X), math.floor(screenPoint.Y), game
-                    )
-                end)
-                lastMouseMove = now
-            end
+    local function onRenderStep()
+        if AutoRaid.Enabled then
+            enforceProneOrientation()
         end
     end
 
@@ -4509,8 +4387,6 @@ do
         local token = AutoRaid.Token
         AutoRaid.Target = nil
         AutoRaid.AimPosition = nil
-        cachedTargetDistance = math.huge
-        lastMobScan = 0
         removeHoverForces()
 
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
@@ -4525,49 +4401,32 @@ do
             while isActive(token) do
                 local char, hum, root = getCharacter()
                 if not (char and hum and root) then
-                    AutoRaid.Target = nil
-                    AutoRaid.AimPosition = nil
                     task.wait(0.25)
                 else
                     if activeRoot ~= root or not (bodyPosition and bodyPosition.Parent == root) then
                         attachHover(char, hum, root)
-                        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
-                        RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 2, onRenderStep)
                     end
 
+                    -- Recalcula o solo periodicamente para acompanhar o terreno e aplica
+                    -- alterações do controle Distância sem afetar a assistência de mira.
                     local now = os.clock()
-                    -- Mantém a posição no ar e aplica alterações do slider Distância em tempo real.
                     if bodyPosition and hoverAnchor and targetGroundY then
                         if appliedHoverHeight ~= AutoRaid.HoverHeight then
                             local refreshedGroundY = findGroundY(char, root)
-                            if refreshedGroundY then
-                                groundBaseY = refreshedGroundY
-                            end
+                            if refreshedGroundY then groundBaseY = refreshedGroundY end
                             appliedHoverHeight = AutoRaid.HoverHeight
                             targetGroundY = (groundBaseY or (root.Position.Y - AutoRaid.HoverHeight))
                                 + AutoRaid.HoverHeight
+                        elseif now - lastGroundScan >= 1.5 then
+                            local refreshedGroundY = findGroundY(char, root)
+                            if refreshedGroundY then
+                                groundBaseY = refreshedGroundY
+                                targetGroundY = groundBaseY + AutoRaid.HoverHeight
+                            end
+                            lastGroundScan = now
                         end
                         currentHoverY = targetGroundY
                         bodyPosition.Position = Vector3.new(hoverAnchor.X, targetGroundY, hoverAnchor.Z)
-                    end
-
-                    if now - lastMobScan >= 0.8 then
-                        local candidate, candidateDistance = nearestMob(root.Position)
-                        local currentTarget = AutoRaid.Target
-                        local currentRoot = getModelRoot(currentTarget)
-                        local currentDistance = currentRoot and (currentRoot.Position - root.Position).Magnitude or math.huge
-                        -- Evita alternância rápida entre dois mobs quase à mesma distância.
-                        if candidate and (not isLivingTarget(currentTarget) or candidate == currentTarget
-                            or candidateDistance + 3 < currentDistance) then
-                            AutoRaid.Target = candidate
-                            cachedTargetDistance = candidateDistance
-                        elseif not isLivingTarget(currentTarget) then
-                            AutoRaid.Target = candidate
-                            cachedTargetDistance = candidateDistance
-                        else
-                            cachedTargetDistance = currentDistance
-                        end
-                        lastMobScan = now
                     end
                     task.wait(0.05)
                 end
@@ -4596,6 +4455,163 @@ do
 
     AutoRaid.Start = startAutoRaid
     AutoRaid.Stop = stopAutoRaid
+end
+
+--// ==========================================
+--// AUTO RAID — ASSISTÊNCIA DE MIRA INDEPENDENTE (SOMENTE MOBS)
+--// ==========================================
+local AutoRaidAssist = {
+    Enabled = false,
+    Token = 0,
+    Thread = nil,
+    Target = nil,
+    Start = nil,
+    Stop = nil,
+}
+
+do
+    local STEER_NAME = "RamdomHubAutoRaidAssistAim"
+    local lastMouseMove = 0
+
+    local function getCharacterRoot()
+        local char = player.Character
+        if not char then return nil end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if hum and root and hum.Health > 0 then return root end
+        return nil
+    end
+
+    local function getModelRoot(model)
+        if not (model and model.Parent) then return nil end
+        return model:FindFirstChild("HumanoidRootPart")
+            or model.PrimaryPart
+            or model:FindFirstChild("UpperTorso")
+            or model:FindFirstChild("Torso")
+            or model:FindFirstChild("Head")
+            or model:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function isValidAimMob(model)
+        if not (model and model:IsA("Model") and model.Parent and model:IsDescendantOf(workspace)) then
+            return false
+        end
+        if model == player.Character or Players:GetPlayerFromCharacter(model) then return false end
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        if not (hum and hum.Health > 0 and getModelRoot(model)) then return false end
+        return AutoMob.IsValidMob ~= nil and AutoMob.IsValidMob(model) == true
+    end
+
+    local function getAimPosition(model)
+        if not isValidAimMob(model) then return nil end
+        local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        if torso and torso:IsA("BasePart") then return torso.Position end
+        local root = getModelRoot(model)
+        if not root then return nil end
+        local ok, _, size = pcall(function()
+            local cf, bounds = model:GetBoundingBox()
+            return cf, bounds
+        end)
+        if ok and typeof(size) == "Vector3" then
+            return Vector3.new(root.Position.X, root.Position.Y + math.clamp(size.Y * 0.12, 1, 3), root.Position.Z)
+        end
+        return root.Position + Vector3.new(0, 1.5, 0)
+    end
+
+    local function findNearestMob(origin)
+        local best, bestDistance = nil, math.huge
+        for _, item in ipairs(workspace:GetDescendants()) do
+            if item:IsA("Humanoid") and item.Health > 0 then
+                local model = item.Parent
+                if isValidAimMob(model) then
+                    local root = getModelRoot(model)
+                    if root then
+                        local distance = (root.Position - origin).Magnitude
+                        if distance < bestDistance then
+                            best, bestDistance = model, distance
+                        end
+                    end
+                end
+            end
+        end
+        return best, bestDistance
+    end
+
+    local function onRenderStep(dt)
+        if not AutoRaidAssist.Enabled then return end
+        local aimPosition = getAimPosition(AutoRaidAssist.Target)
+        if not aimPosition then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+
+        -- Assistência de mira separada: só acompanha mobs válidos e não controla o voo.
+        local current = cam.CFrame
+        local desired = CFrame.lookAt(current.Position, aimPosition)
+        local alpha = math.clamp((dt or 1 / 60) * 16, 0, 1)
+        cam.CFrame = current:Lerp(desired, alpha)
+
+        local now = os.clock()
+        if now - lastMouseMove >= 0.08 then
+            local screenPoint, onScreen = cam:WorldToViewportPoint(aimPosition)
+            if onScreen and screenPoint.Z > 0 then
+                pcall(function()
+                    VirtualInputManager:SendMouseMoveEvent(
+                        math.floor(screenPoint.X), math.floor(screenPoint.Y), game
+                    )
+                end)
+                lastMouseMove = now
+            end
+        end
+    end
+
+    local function startAssist()
+        if AutoRaidAssist.Enabled then return end
+        AutoRaidAssist.Enabled = true
+        AutoRaidAssist.Token = AutoRaidAssist.Token + 1
+        local token = AutoRaidAssist.Token
+        AutoRaidAssist.Target = nil
+        lastMouseMove = 0
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 3, onRenderStep)
+
+        AutoRaidAssist.Thread = task.spawn(function()
+            while AutoRaidAssist.Enabled and AutoRaidAssist.Token == token do
+                local root = getCharacterRoot()
+                if root then
+                    local candidate, candidateDistance = findNearestMob(root.Position)
+                    local current = AutoRaidAssist.Target
+                    local currentRoot = getModelRoot(current)
+                    local currentDistance = currentRoot and (currentRoot.Position - root.Position).Magnitude or math.huge
+                    -- Evita troca nervosa quando dois mobs estão praticamente à mesma distância.
+                    if candidate and (not isValidAimMob(current) or candidate == current
+                        or candidateDistance + 3 < currentDistance) then
+                        AutoRaidAssist.Target = candidate
+                    elseif not isValidAimMob(current) then
+                        AutoRaidAssist.Target = candidate
+                    end
+                else
+                    AutoRaidAssist.Target = nil
+                end
+                task.wait(0.65)
+            end
+            AutoRaidAssist.Thread = nil
+        end)
+    end
+
+    local function stopAssist()
+        if not AutoRaidAssist.Enabled then return end
+        AutoRaidAssist.Enabled = false
+        AutoRaidAssist.Token = AutoRaidAssist.Token + 1
+        AutoRaidAssist.Target = nil
+        if AutoRaidAssist.Thread then
+            pcall(task.cancel, AutoRaidAssist.Thread)
+            AutoRaidAssist.Thread = nil
+        end
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+    end
+
+    AutoRaidAssist.Start = startAssist
+    AutoRaidAssist.Stop = stopAssist
 end
 
 --// ==========================================
@@ -5192,7 +5208,7 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v1.5", "+ Auto Raid Adicionado\n+ Bugs Fix", 100)
+createUpdateCard(HomePage, 2, "v1.6", "+ Melhoria no Auto Raid\n+ Adicionado Performance de VFX (Reduz a Qualidade do VFX)", 100)
 
 --// ==========================================
 --// ABA COMBAT
@@ -5666,13 +5682,28 @@ setAutoRaid, getAutoRaid = createToggleCard(
     end
 )
 
+--// Assistência de mira independente do Auto Raid
+local setAutoRaidAssist, getAutoRaidAssist = createToggleCard(
+    AutoRaidPage,
+    2,
+    "Assistência de Mira",
+    false,
+    function(state)
+        if state then
+            AutoRaidAssist.Start()
+        else
+            AutoRaidAssist.Stop()
+        end
+    end
+)
+
 --// Controle de distância do Auto Raid (30 a 100 studs)
 local AutoRaidDistanceCard = Instance.new("Frame")
 AutoRaidDistanceCard.Name = "AutoRaidDistanceCard"
 AutoRaidDistanceCard.Size = UDim2.new(1, 0, 0, 88)
 AutoRaidDistanceCard.BackgroundColor3 = Theme.Card
 AutoRaidDistanceCard.BorderSizePixel = 0
-AutoRaidDistanceCard.LayoutOrder = 2
+AutoRaidDistanceCard.LayoutOrder = 3
 AutoRaidDistanceCard.Parent = AutoRaidPage
 addCorner(AutoRaidDistanceCard, 14)
 addStroke(AutoRaidDistanceCard, Theme.Stroke, 1, 0.5)
@@ -6360,10 +6391,200 @@ setOtimizacao, getOtimizacao = createToggleCard(
     end
 )
 
+--// ==========================================
+--// PERFORMANCE VFX — SIMPLIFICAÇÃO LOCAL DE EFEITOS
+--// Observação: Roblox não expõe uma propriedade para reduzir a resolução
+--// nativa de uma textura para 144p. Esta opção reduz densidade, tamanho e
+--// duração de efeitos comuns, mantendo as texturas originais.
+--// ==========================================
+local setPerformanceVFX, getPerformanceVFX
+local PerformanceVFXState = {
+    Active = false,
+    Token = 0,
+    Connection = nil,
+    Original = setmetatable({}, { __mode = "k" }),
+}
+
+local function scaleVFXNumberSequence(sequence, factor)
+    local keypoints = sequence.Keypoints
+    local scaled = table.create(#keypoints)
+    for i, keypoint in ipairs(keypoints) do
+        scaled[i] = NumberSequenceKeypoint.new(
+            keypoint.Time,
+            keypoint.Value * factor,
+            keypoint.Envelope * factor
+        )
+    end
+    return NumberSequence.new(scaled)
+end
+
+local function softenVFXTransparency(sequence, visibleFactor)
+    local keypoints = sequence.Keypoints
+    local softened = table.create(#keypoints)
+    for i, keypoint in ipairs(keypoints) do
+        local newValue = 1 - (1 - keypoint.Value) * visibleFactor
+        softened[i] = NumberSequenceKeypoint.new(
+            keypoint.Time,
+            math.clamp(newValue, 0, 1),
+            keypoint.Envelope * visibleFactor
+        )
+    end
+    return NumberSequence.new(softened)
+end
+
+local function simplifyVFXObject(obj)
+    if not PerformanceVFXState.Active or not obj or not obj.Parent then return end
+    if PerformanceVFXState.Original[obj] then return end
+
+    local ok, className = pcall(function() return obj.ClassName end)
+    if not ok then return end
+
+    local saved = { ClassName = className }
+    local recognized = false
+
+    if obj:IsA("ParticleEmitter") then
+        saved.Rate = obj.Rate
+        saved.Lifetime = obj.Lifetime
+        saved.Size = obj.Size
+        saved.LightEmission = obj.LightEmission
+        recognized = true
+    elseif obj:IsA("Beam") then
+        saved.Width0 = obj.Width0
+        saved.Width1 = obj.Width1
+        saved.Transparency = obj.Transparency
+        recognized = true
+    elseif obj:IsA("Trail") then
+        saved.Lifetime = obj.Lifetime
+        saved.WidthScale = obj.WidthScale
+        saved.Transparency = obj.Transparency
+        recognized = true
+    elseif obj:IsA("Fire") then
+        saved.Size = obj.Size
+        saved.Heat = obj.Heat
+        recognized = true
+    elseif obj:IsA("Smoke") then
+        saved.Size = obj.Size
+        saved.Opacity = obj.Opacity
+        saved.RiseVelocity = obj.RiseVelocity
+        recognized = true
+    end
+
+    if not recognized then return end
+    PerformanceVFXState.Original[obj] = saved
+
+    pcall(function()
+        if obj:IsA("ParticleEmitter") then
+            -- Reduz bastante a quantidade de partículas e encurta sua presença.
+            if saved.Rate > 0 then
+                obj.Rate = math.max(0.1, math.min(saved.Rate * 0.18, 10))
+            end
+            obj.Lifetime = NumberRange.new(
+                math.max(0.05, saved.Lifetime.Min * 0.65),
+                math.max(0.05, saved.Lifetime.Max * 0.65)
+            )
+            obj.Size = scaleVFXNumberSequence(saved.Size, 0.72)
+            obj.LightEmission = saved.LightEmission * 0.55
+        elseif obj:IsA("Beam") then
+            obj.Width0 = saved.Width0 * 0.72
+            obj.Width1 = saved.Width1 * 0.72
+            obj.Transparency = softenVFXTransparency(saved.Transparency, 0.62)
+        elseif obj:IsA("Trail") then
+            obj.Lifetime = math.max(0.05, saved.Lifetime * 0.55)
+            obj.WidthScale = scaleVFXNumberSequence(saved.WidthScale, 0.72)
+            obj.Transparency = softenVFXTransparency(saved.Transparency, 0.62)
+        elseif obj:IsA("Fire") then
+            obj.Size = saved.Size * 0.7
+            obj.Heat = saved.Heat * 0.7
+        elseif obj:IsA("Smoke") then
+            obj.Size = saved.Size * 0.7
+            obj.Opacity = saved.Opacity * 0.7
+            obj.RiseVelocity = saved.RiseVelocity * 0.7
+        end
+    end)
+end
+
+local function restorePerformanceVFX()
+    PerformanceVFXState.Active = false
+    PerformanceVFXState.Token = PerformanceVFXState.Token + 1
+    if PerformanceVFXState.Connection then
+        PerformanceVFXState.Connection:Disconnect()
+        PerformanceVFXState.Connection = nil
+    end
+
+    for obj, saved in pairs(PerformanceVFXState.Original) do
+        pcall(function()
+            if obj and obj.Parent then
+                if saved.ClassName == "ParticleEmitter" then
+                    obj.Rate = saved.Rate
+                    obj.Lifetime = saved.Lifetime
+                    obj.Size = saved.Size
+                    obj.LightEmission = saved.LightEmission
+                elseif saved.ClassName == "Beam" then
+                    obj.Width0 = saved.Width0
+                    obj.Width1 = saved.Width1
+                    obj.Transparency = saved.Transparency
+                elseif saved.ClassName == "Trail" then
+                    obj.Lifetime = saved.Lifetime
+                    obj.WidthScale = saved.WidthScale
+                    obj.Transparency = saved.Transparency
+                elseif saved.ClassName == "Fire" then
+                    obj.Size = saved.Size
+                    obj.Heat = saved.Heat
+                elseif saved.ClassName == "Smoke" then
+                    obj.Size = saved.Size
+                    obj.Opacity = saved.Opacity
+                    obj.RiseVelocity = saved.RiseVelocity
+                end
+            end
+        end)
+        PerformanceVFXState.Original[obj] = nil
+    end
+end
+
+local function setPerformanceVFXActive(state)
+    if state then
+        if PerformanceVFXState.Active then return end
+        PerformanceVFXState.Active = true
+        PerformanceVFXState.Token = PerformanceVFXState.Token + 1
+        local token = PerformanceVFXState.Token
+
+        PerformanceVFXState.Connection = workspace.DescendantAdded:Connect(function(obj)
+            task.defer(function()
+                if PerformanceVFXState.Active and PerformanceVFXState.Token == token
+                    and obj and obj.Parent then
+                    simplifyVFXObject(obj)
+                end
+            end)
+        end)
+
+        task.spawn(function()
+            for index, obj in ipairs(workspace:GetDescendants()) do
+                if not PerformanceVFXState.Active or PerformanceVFXState.Token ~= token then
+                    break
+                end
+                simplifyVFXObject(obj)
+                if index % 400 == 0 then task.wait() end
+            end
+        end)
+    else
+        restorePerformanceVFX()
+    end
+end
+
+setPerformanceVFX, getPerformanceVFX = createToggleCard(
+    ConfigScroll,
+    4,
+    "Performance VFX",
+    false,
+    function(state)
+        setPerformanceVFXActive(state)
+    end
+)
+
 -- Toggle opcional para destacar localmente as estruturas já escondidas.
 local setLocate, getLocate = createToggleCard(
     ConfigScroll,
-    4,
+    5,
     "Localizar Estruturas",
     false,
     function(state)
@@ -6448,6 +6669,7 @@ end
 
 local function destroyScript()
     pcall(AutoRaid.Stop)
+    pcall(AutoRaidAssist.Stop)
     pcall(AutoMob.Stop)
     pcall(AutoMiner.Stop)
     pcall(AutoWood.Stop)
