@@ -65,19 +65,18 @@ local setLocateStructures, getLocateStructures
 --// ==========================================
 local MOB_CFG = {
     SearchRadius = 150,          
-    SelectedSearchRadius = 1000, 
+    SelectedSearchRadius = math.huge, 
     StopDistance = 3,            
     StopBuffer = 1.5,            
     MobTimeout = 60,             
     GiveUpTime = 12,             
     IgnoreTime = 20,             
     TickRate = 0.1,              
-    ObstacleRayDistance = 5.5,
-    ObstacleJumpTrigger = 0.8,
-    ObstacleJumpInterval = 0.15,
-    ObstacleJumpClearDelay = 0.6,
-    ObstacleJumpMinProgress = 1.2,
-    ObstacleJumpMaxTime = 8,
+    ObstacleRayDistance = 7.5,
+    ObstacleJumpTrigger = 0.9,        -- tempo sem avanço em direção ao alvo antes de iniciar a recuperação
+    ObstacleJumpInterval = 0.12,      -- frequência do pulo repetido durante a recuperação
+    ObstacleJumpClearDelay = 0.45,    -- tempo mínimo pulando antes de avaliar a saída
+    ObstacleJumpMinProgress = 1.5,    -- avanço acumulado necessário para considerar que destravou
     AnyWhenNoSelection = true,   
     AttackOnlySelected = true,   
     HoldShiftWhileMoving = true, 
@@ -578,6 +577,67 @@ do
         return h ~= nil and h.Health > 0
     end
 
+    -- Aceita a barra nativa do Humanoid ou uma barra customizada no BillboardGui.
+    -- Isso ajuda a evitar NPCs decorativos/de missão que têm modelo, mas não têm barra de vida.
+    local HEALTH_BAR_HINTS = {
+        "health", "healthbar", "health_bar", "hpbar", "hp_bar",
+        "hitpoint", "hit_point", "vida", "life_bar", "lifebar",
+    }
+    local NPC_NAME_HINTS = {
+        "quest", "npc", "vendor", "merchant", "shopkeeper",
+        "blacksmith", "mission", "trainer", "questgiver", "quest giver",
+    }
+
+    local function containsHealthBarHint(value)
+        local lower = string.lower(tostring(value or ""))
+        for _, hint in ipairs(HEALTH_BAR_HINTS) do
+            if lower:find(hint, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function hasHealthBar(model, hum)
+        local nativeOk, nativeBarEnabled = pcall(function()
+            if hum.MaxHealth <= 0 or hum.HealthDisplayDistance <= 0
+                or hum.DisplayDistanceType == Enum.HumanoidDisplayDistanceType.None then
+                return false
+            end
+
+            local displayType = hum.HealthDisplayType
+            return displayType == Enum.HumanoidHealthDisplayType.AlwaysOn
+                or (displayType == Enum.HumanoidHealthDisplayType.DisplayWhenDamaged
+                    and hum.Health < hum.MaxHealth)
+        end)
+        if nativeOk and nativeBarEnabled then
+            return true
+        end
+
+        for _, gui in ipairs(model:GetDescendants()) do
+            if gui:IsA("BillboardGui") and gui.Enabled then
+                if containsHealthBarHint(gui.Name) then
+                    return true
+                end
+
+                for _, element in ipairs(gui:GetDescendants()) do
+                    if containsHealthBarHint(element.Name) then
+                        return true
+                    end
+                    if element:IsA("TextLabel") then
+                        local labelText = string.lower(tostring(element.Text or ""))
+                        if containsHealthBarHint(labelText)
+                            or labelText:match("%d+%s*/%s*%d+")
+                            or labelText:match("%d+%%") then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+        return false
+    end
+
     local function getMobLevel(model)
         local lvl = model.Name:match("%[Lv%.?%s*(%d+)%]") or model.Name:match("[Ll]v%.?%s*(%d+)")
         if lvl then return tonumber(lvl) end
@@ -600,16 +660,20 @@ do
         if isPlayerModel(model) then return false end
         
         local lowerName = string.lower(model.Name)
-        if string.find(lowerName, "quest") or string.find(lowerName, "npc") then 
-            return false 
+        for _, hint in ipairs(NPC_NAME_HINTS) do
+            if lowerName:find(hint, 1, true) then
+                return false
+            end
         end
 
         local hum = model:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then return false end
-        
+        if not hasHealthBar(model, hum) then return false end
+
+        -- Interactivos suelen ser NPCs de diálogo/tienda/quest, no mobs de combate.
         for _, d in ipairs(model:GetDescendants()) do
-            if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then 
-                return false 
+            if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+                return false
             end
         end
         return true
@@ -696,29 +760,55 @@ do
     end
 
     local moving = false
-    local keysDown = false
+    local wDown = false
+    local shiftDown = false
+    local moveSequence = 0
     local steerPart = nil
 
-    local function sendKeys(down)
-        if not MOB_CFG.HoldShiftWhileMoving then return end
+    local function sendMoveKey(keyCode, down)
         pcall(function()
-            VirtualInputManager:SendKeyEvent(down, Enum.KeyCode.LeftShift, false, game)
+            VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
         end)
+    end
+
+    local function releaseMoveKeys()
+        -- Solta Shift primeiro e W depois para evitar deixar a corrida presa.
+        if shiftDown then
+            sendMoveKey(Enum.KeyCode.LeftShift, false)
+            shiftDown = false
+        end
+        if wDown then
+            sendMoveKey(Enum.KeyCode.W, false)
+            wDown = false
+        end
     end
 
     local function setMoving(state)
         if state then
+            if moving then return end
+
             moving = true
-            if not keysDown then
-                keysDown = true
-                sendKeys(true)
+            moveSequence = moveSequence + 1
+            local thisSequence = moveSequence
+
+            -- O jogo exige W pressionado antes de Shift para ativar a corrida.
+            sendMoveKey(Enum.KeyCode.W, true)
+            wDown = true
+
+            if MOB_CFG.HoldShiftWhileMoving then
+                task.delay(0.35, function()
+                    -- Só ativa a corrida se o mesmo ciclo de movimento ainda estiver ativo.
+                    if moving and moveSequence == thisSequence and wDown
+                        and MOB_CFG.HoldShiftWhileMoving and not shiftDown then
+                        sendMoveKey(Enum.KeyCode.LeftShift, true)
+                        shiftDown = true
+                    end
+                end)
             end
         else
             moving = false
-            if keysDown then
-                keysDown = false
-                sendKeys(false)
-            end
+            moveSequence = moveSequence + 1 -- invalida qualquer atraso pendente
+            releaseMoveKeys()
         end
     end
 
@@ -754,7 +844,8 @@ do
                     local model = d.Parent
                     if model and model:IsA("Model") then
                         local mr = modelRoot(model)
-                        if mr and (mr.Position - root.Position).Magnitude <= MOB_CFG.SearchRadius and isValidMob(model) then
+                        -- A lista mostra mobs em todo o mapa, não só os que estão próximos.
+                        if mr and isValidMob(model) then
                             local key, level, id = getMobType(model)
                             local item = byId[id]
                             if not item then
@@ -848,6 +939,8 @@ do
         end
 
         local now = os.clock()
+        -- Com um tipo selecionado, não aplica limite de distância: procura esse tipo
+        -- em qualquer ponto do mapa que esteja replicado/carregado no cliente.
         local best, bestDist = nil, selected and MOB_CFG.SelectedSearchRadius or MOB_CFG.SearchRadius
 
         for _, d in ipairs(workspace:GetDescendants()) do
@@ -898,7 +991,7 @@ do
             0,
             targetRoot.Position.Z - root.Position.Z
         )
-        if towardTarget.Magnitude < 1 then return false end
+        if towardTarget.Magnitude < 0.75 then return false end
 
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
@@ -906,6 +999,7 @@ do
         params.RespectCanCollide = true
 
         local direction = towardTarget.Unit
+        local side = Vector3.new(direction.Z, 0, -direction.X)
         local rayLength = math.min(MOB_CFG.ObstacleRayDistance, towardTarget.Magnitude)
 
         local function isSolidObstacle(hit)
@@ -917,11 +1011,20 @@ do
             return true
         end
 
-        local lowOrigin = root.Position + Vector3.new(0, 0.25, 0)
-        local highOrigin = root.Position + Vector3.new(0, 1.5, 0)
-        local lowHit = workspace:Raycast(lowOrigin, direction * rayLength, params)
-        local highHit = workspace:Raycast(highOrigin, direction * rayLength, params)
-        return isSolidObstacle(lowHit) or isSolidObstacle(highHit)
+        -- Raios em alturas diferentes e ligeiramente deslocados para os lados
+        -- ajudam a encontrar paredes, cantos e obstáculos baixos/altos.
+        local heights = { 0.35, 1.35, 2.25 }
+        local sideOffsets = { 0, -0.45, 0.45 }
+        for _, height in ipairs(heights) do
+            for _, offset in ipairs(sideOffsets) do
+                local origin = root.Position + Vector3.new(0, height, 0) + side * offset
+                local hit = workspace:Raycast(origin, direction * rayLength, params)
+                if isSolidObstacle(hit) then
+                    return true
+                end
+            end
+        end
+        return false
     end
 
     local function chase(mob, token)
@@ -940,8 +1043,10 @@ do
         local lastCheck, lastPos, stuck = t0, nil, 0
         local jumpRecovery = false
         local jumpRecoveryStartedAt = 0
-        local jumpRecoveryStartPos = nil
+        local recoveryForwardProgress = 0
         local lastRecoveryJumpAt = 0
+        local obstacleAhead = false
+        local lastObstacleCheck = 0
         local selVersion = AutoMob.SelectionVersion
         local reason = "fim"
 
@@ -979,6 +1084,8 @@ do
                 local now = os.clock()
                 lastNear, progressAt, bestDist = now, now, math.huge
                 engaged, lastPos, stuck = false, nil, 0
+                jumpRecovery = false
+                recoveryForwardProgress = 0
                 setStatus("aguardando seu personagem...")
                 task.wait(0.3)
             else
@@ -1002,7 +1109,7 @@ do
                     faceTo(root, mr.Position)
                     stuck, lastPos = 0, nil
                     jumpRecovery = false
-                    jumpRecoveryStartPos = nil
+                    recoveryForwardProgress = 0
                     lastNear, progressAt, bestDist = now, now, dist
                 else
                     setMoving(true)
@@ -1011,7 +1118,9 @@ do
                     else
                         setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
                     end
-                    hum:MoveTo(mr.Position)
+                    -- O deslocamento até o alvo é feito pelo controle normal do jogo:
+                    -- W fica pressionado e Shift é acionado após 0,35 segundo.
+                    -- Não chamar MoveTo(mr.Position) aqui evita competir com o input de corrida.
 
                     if dist < bestDist - 1.5 then
                         bestDist, progressAt = dist, now
@@ -1020,64 +1129,94 @@ do
                         lastNear, progressAt = now, now
                     end
 
-                    if now - lastCheck >= 0.5 then
-                        if lastPos and (root.Position - lastPos).Magnitude < 1 then
-                            stuck = stuck + (now - lastCheck)
-                        else
-                            stuck = 0
+                    -- Mede avanço REAL na direção do alvo. Deslocar-se para o lado,
+                    -- para trás ou apenas pular parado também conta como estar preso.
+                    local forwardProgressThisSample = 0
+                    if now - lastCheck >= 0.4 then
+                        local sampleTime = math.max(now - lastCheck, 0.01)
+                        if lastPos then
+                            local delta = root.Position - lastPos
+                            local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
+                            local towardTarget = Vector3.new(
+                                mr.Position.X - root.Position.X,
+                                0,
+                                mr.Position.Z - root.Position.Z
+                            )
+                            if towardTarget.Magnitude > 0.1 then
+                                forwardProgressThisSample = horizontalDelta:Dot(towardTarget.Unit)
+                            end
+
+                            local barelyMoved = horizontalDelta.Magnitude < 0.55
+                            local movingSidewaysOrBack = horizontalDelta.Magnitude >= 0.25
+                                and forwardProgressThisSample < math.max(0.12, horizontalDelta.Magnitude * 0.30)
+
+                            if barelyMoved or movingSidewaysOrBack then
+                                stuck = stuck + sampleTime
+                            else
+                                stuck = 0
+                            end
+
+                            if jumpRecovery and forwardProgressThisSample > 0.12 then
+                                recoveryForwardProgress = recoveryForwardProgress + forwardProgressThisSample
+                            end
                         end
                         lastPos, lastCheck = root.Position, now
                     end
 
-                    local obstacleAhead = false
-                    if jumpRecovery or stuck >= MOB_CFG.ObstacleJumpTrigger then
+                    if (jumpRecovery or stuck >= 0.15)
+                        and now - lastObstacleCheck >= 0.25 then
                         obstacleAhead = hasObstacleAhead(root, mr, mob)
+                        lastObstacleCheck = now
                     end
 
-                    if not jumpRecovery and stuck >= MOB_CFG.ObstacleJumpTrigger and obstacleAhead then
+                    -- A colisão detectada no caminho reduz o tempo de espera,
+                    -- mas o detector de movimento também funciona quando o raycast
+                    -- não consegue identificar a geometria do jogo.
+                    local shouldStartJump = stuck >= MOB_CFG.ObstacleJumpTrigger
+                        or (obstacleAhead and stuck >= MOB_CFG.ObstacleJumpTrigger * 0.55)
+                    if not jumpRecovery and shouldStartJump then
                         jumpRecovery = true
                         jumpRecoveryStartedAt = now
-                        jumpRecoveryStartPos = root.Position
+                        recoveryForwardProgress = 0
                         lastRecoveryJumpAt = 0
-                        setStatus("obstáculo detectado; pulando para passar...")
+                        lastPos = root.Position
+                        lastCheck = now
+                        if obstacleAhead then
+                            setStatus("obstáculo na rota; usando pulo contínuo...")
+                        else
+                            setStatus("travado sem avançar; usando pulo contínuo...")
+                        end
                     end
 
                     if jumpRecovery then
-                        local startPos = jumpRecoveryStartPos or root.Position
-                        local horizontalProgress = Vector3.new(
-                            root.Position.X - startPos.X,
-                            0,
-                            root.Position.Z - startPos.Z
-                        ).Magnitude
                         local recoveryAge = now - jumpRecoveryStartedAt
+                        local forwardMovementResumed = recoveryAge >= MOB_CFG.ObstacleJumpClearDelay
+                            and recoveryForwardProgress >= MOB_CFG.ObstacleJumpMinProgress
+                            and stuck < 0.35
 
-                        if recoveryAge >= MOB_CFG.ObstacleJumpClearDelay
-                            and horizontalProgress >= MOB_CFG.ObstacleJumpMinProgress
-                            and not obstacleAhead then
+                        if forwardMovementResumed then
                             jumpRecovery = false
-                            jumpRecoveryStartPos = nil
+                            recoveryForwardProgress = 0
                             stuck = 0
                             lastPos = root.Position
                             lastCheck = now
-                            progressAt = now
                             lastNear = now
+                            progressAt = now
                             bestDist = dist
                         elseif now - lastRecoveryJumpAt >= MOB_CFG.ObstacleJumpInterval then
+                            -- Repete o comando sem limite de tempo enquanto não
+                            -- recuperar movimento para frente; MoveTo continua ativo.
                             pcall(function()
                                 hum.Jump = true
                                 hum:ChangeState(Enum.HumanoidStateType.Jumping)
                             end)
                             lastRecoveryJumpAt = now
                         end
-                    elseif stuck > 1 then
-                        hum.Jump = true
                     end
 
-                    local giveUpByJump = jumpRecovery
-                        and (now - jumpRecoveryStartedAt > MOB_CFG.ObstacleJumpMaxTime)
-                    if giveUpByJump
-                        or (not jumpRecovery and (now - progressAt > MOB_CFG.GiveUpTime
-                            or now - lastNear > nearLimit)) then
+                    -- O tempo de desistência fica suspenso durante o pulo contínuo.
+                    if not jumpRecovery and (now - progressAt > MOB_CFG.GiveUpTime
+                        or now - lastNear > nearLimit) then
                         reason = "inalcancavel"
                         break
                     end
@@ -1088,7 +1227,7 @@ do
         end
 
         jumpRecovery = false
-        jumpRecoveryStartPos = nil
+        recoveryForwardProgress = 0
         steerPart = nil
         return reason
     end
@@ -3942,7 +4081,7 @@ do
     MobInfoText.Size = UDim2.new(1, -30, 1, 0)
     MobInfoText.Position = UDim2.new(0, 20, 0, 0)
     MobInfoText.BackgroundTransparency = 1
-    MobInfoText.Text = "Aproxime-se do mob desejado e selecione-o na lista acima para iniciar o farm."
+    MobInfoText.Text = "Selecione um tipo de mob na lista; o Auto Farm procura pelo mapa e vai até ele mesmo de longe."
     MobInfoText.TextColor3 = Theme.TextDim
     MobInfoText.Font = Enum.Font.Gotham
     MobInfoText.TextSize = 11
@@ -4737,4 +4876,4 @@ pcall(function()
         Text = "Fps Boost agora vê o mapa inteiro e apaga tudo instantaneamente!",
         Duration = 5,
     })
-end)
+end)s
