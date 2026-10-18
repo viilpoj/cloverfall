@@ -1,12 +1,11 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.4                     ║
+    ║                 RAMDOM HUB  v1.45                    ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Wood Beta, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v1.4:
-      + Melhoria Auto Farm
-      + Adicionado Auto Wood (Auto Itens)
+    v1.45:
+      + Melhoria Fps Boost
 ]]
 
 --// Serviços
@@ -39,7 +38,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.4",
+    Version = "1.45",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -65,11 +64,6 @@ local MOB_CFG = {
     GiveUpTime = 12,             
     IgnoreTime = 20,             
     TickRate = 0.1,              
-    ObstacleRayDistance = 7.5,
-    ObstacleJumpTrigger = 0.9,        -- tempo sem avanço em direção ao alvo antes de iniciar a recuperação
-    ObstacleJumpInterval = 0.12,      -- frequência do pulo repetido durante a recuperação
-    ObstacleJumpClearDelay = 0.45,    -- tempo mínimo pulando antes de avaliar a saída
-    ObstacleJumpMinProgress = 1.5,    -- avanço acumulado necessário para considerar que destravou
     AnyWhenNoSelection = true,   
     AttackOnlySelected = true,   
     HoldShiftWhileMoving = true, 
@@ -1032,48 +1026,6 @@ do
         root.CFrame = CFrame.lookAt(root.Position, Vector3.new(pos.X, root.Position.Y, pos.Z))
     end
 
-    local function hasObstacleAhead(root, targetRoot, targetModel)
-        local towardTarget = Vector3.new(
-            targetRoot.Position.X - root.Position.X,
-            0,
-            targetRoot.Position.Z - root.Position.Z
-        )
-        if towardTarget.Magnitude < 0.75 then return false end
-
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = { player.Character, targetModel }
-        params.RespectCanCollide = true
-
-        local direction = towardTarget.Unit
-        local side = Vector3.new(direction.Z, 0, -direction.X)
-        local rayLength = math.min(MOB_CFG.ObstacleRayDistance, towardTarget.Magnitude)
-
-        local function isSolidObstacle(hit)
-            if not hit then return false end
-            local hitModel = hit.Instance:FindFirstAncestorOfClass("Model")
-            if hitModel and hitModel:FindFirstChildOfClass("Humanoid") then
-                return false
-            end
-            return true
-        end
-
-        -- Raios em alturas diferentes e ligeiramente deslocados para os lados
-        -- ajudam a encontrar paredes, cantos e obstáculos baixos/altos.
-        local heights = { 0.35, 1.35, 2.25 }
-        local sideOffsets = { 0, -0.45, 0.45 }
-        for _, height in ipairs(heights) do
-            for _, offset in ipairs(sideOffsets) do
-                local origin = root.Position + Vector3.new(0, height, 0) + side * offset
-                local hit = workspace:Raycast(origin, direction * rayLength, params)
-                if isSolidObstacle(hit) then
-                    return true
-                end
-            end
-        end
-        return false
-    end
-
     local function chase(mob, token)
         local mr0 = modelRoot(mob)
         local reach = MOB_CFG.StopDistance + getMobRadius(mob, mr0)
@@ -1087,13 +1039,6 @@ do
         local progressAt = t0          
         local bestDist = math.huge
         local engaged = false          
-        local lastCheck, lastPos, stuck = t0, nil, 0
-        local jumpRecovery = false
-        local jumpRecoveryStartedAt = 0
-        local recoveryForwardProgress = 0
-        local lastRecoveryJumpAt = 0
-        local obstacleAhead = false
-        local lastObstacleCheck = 0
         local selVersion = AutoMob.SelectionVersion
         local reason = "fim"
 
@@ -1130,9 +1075,7 @@ do
                 steerPart = nil
                 local now = os.clock()
                 lastNear, progressAt, bestDist = now, now, math.huge
-                engaged, lastPos, stuck = false, nil, 0
-                jumpRecovery = false
-                recoveryForwardProgress = 0
+                engaged = false
                 setStatus("aguardando seu personagem...")
                 task.wait(0.3)
             else
@@ -1154,17 +1097,10 @@ do
                     setStatus(string.format("perto de %s (%d studs)", mob.Name, math.floor(dist)))
                     hum:MoveTo(root.Position)
                     faceTo(root, mr.Position)
-                    stuck, lastPos = 0, nil
-                    jumpRecovery = false
-                    recoveryForwardProgress = 0
                     lastNear, progressAt, bestDist = now, now, dist
                 else
                     setMoving(true)
-                    if jumpRecovery then
-                        setStatus("pulando para passar do obstáculo...")
-                    else
-                        setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
-                    end
+                    setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
                     -- O deslocamento até o alvo é feito pelo controle normal do jogo:
                     -- W fica pressionado e Shift é acionado após 0,35 segundo.
                     -- Não chamar MoveTo(mr.Position) aqui evita competir com o input de corrida.
@@ -1176,94 +1112,8 @@ do
                         lastNear, progressAt = now, now
                     end
 
-                    -- Mede avanço REAL na direção do alvo. Deslocar-se para o lado,
-                    -- para trás ou apenas pular parado também conta como estar preso.
-                    local forwardProgressThisSample = 0
-                    if now - lastCheck >= 0.4 then
-                        local sampleTime = math.max(now - lastCheck, 0.01)
-                        if lastPos then
-                            local delta = root.Position - lastPos
-                            local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
-                            local towardTarget = Vector3.new(
-                                mr.Position.X - root.Position.X,
-                                0,
-                                mr.Position.Z - root.Position.Z
-                            )
-                            if towardTarget.Magnitude > 0.1 then
-                                forwardProgressThisSample = horizontalDelta:Dot(towardTarget.Unit)
-                            end
-
-                            local barelyMoved = horizontalDelta.Magnitude < 0.55
-                            local movingSidewaysOrBack = horizontalDelta.Magnitude >= 0.25
-                                and forwardProgressThisSample < math.max(0.12, horizontalDelta.Magnitude * 0.30)
-
-                            if barelyMoved or movingSidewaysOrBack then
-                                stuck = stuck + sampleTime
-                            else
-                                stuck = 0
-                            end
-
-                            if jumpRecovery and forwardProgressThisSample > 0.12 then
-                                recoveryForwardProgress = recoveryForwardProgress + forwardProgressThisSample
-                            end
-                        end
-                        lastPos, lastCheck = root.Position, now
-                    end
-
-                    if (jumpRecovery or stuck >= 0.15)
-                        and now - lastObstacleCheck >= 0.25 then
-                        obstacleAhead = hasObstacleAhead(root, mr, mob)
-                        lastObstacleCheck = now
-                    end
-
-                    -- A colisão detectada no caminho reduz o tempo de espera,
-                    -- mas o detector de movimento também funciona quando o raycast
-                    -- não consegue identificar a geometria do jogo.
-                    local shouldStartJump = stuck >= MOB_CFG.ObstacleJumpTrigger
-                        or (obstacleAhead and stuck >= MOB_CFG.ObstacleJumpTrigger * 0.55)
-                    if not jumpRecovery and shouldStartJump then
-                        jumpRecovery = true
-                        jumpRecoveryStartedAt = now
-                        recoveryForwardProgress = 0
-                        lastRecoveryJumpAt = 0
-                        lastPos = root.Position
-                        lastCheck = now
-                        if obstacleAhead then
-                            setStatus("obstáculo na rota; usando pulo contínuo...")
-                        else
-                            setStatus("travado sem avançar; usando pulo contínuo...")
-                        end
-                    end
-
-                    if jumpRecovery then
-                        local recoveryAge = now - jumpRecoveryStartedAt
-                        local forwardMovementResumed = recoveryAge >= MOB_CFG.ObstacleJumpClearDelay
-                            and recoveryForwardProgress >= MOB_CFG.ObstacleJumpMinProgress
-                            and stuck < 0.35
-
-                        if forwardMovementResumed then
-                            jumpRecovery = false
-                            recoveryForwardProgress = 0
-                            stuck = 0
-                            lastPos = root.Position
-                            lastCheck = now
-                            lastNear = now
-                            progressAt = now
-                            bestDist = dist
-                        elseif now - lastRecoveryJumpAt >= MOB_CFG.ObstacleJumpInterval then
-                            -- Repete o comando sem limite de tempo enquanto não
-                            -- recuperar movimento para frente; MoveTo continua ativo.
-                            pcall(function()
-                                hum.Jump = true
-                                hum:ChangeState(Enum.HumanoidStateType.Jumping)
-                            end)
-                            lastRecoveryJumpAt = now
-                        end
-                    end
-
-                    -- O tempo de desistência fica suspenso durante o pulo contínuo.
-                    if not jumpRecovery and (now - progressAt > MOB_CFG.GiveUpTime
-                        or now - lastNear > nearLimit) then
+                    if now - progressAt > MOB_CFG.GiveUpTime
+                        or now - lastNear > nearLimit then
                         reason = "inalcancavel"
                         break
                     end
@@ -1273,8 +1123,6 @@ do
             end
         end
 
-        jumpRecovery = false
-        recoveryForwardProgress = 0
         steerPart = nil
         return reason
     end
@@ -4950,7 +4798,7 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v1.4", "+ Melhoria Auto Farm\n+ Adicionado Auto Wood (Auto Itens)", 100)
+createUpdateCard(HomePage, 2, "v1.45", "+ Melhoria Fps Boost", 100)
 
 --// ==========================================
 --// ABA COMBAT
@@ -5504,67 +5352,90 @@ local setAntiAFK, getAntiAFK = createToggleCard(
 startAntiAFK()
 
 --// ==========================================
---// FPS BOOST (dentro de Config)
+--// FPS BOOST — CENÁRIO LOCAL + SOMBRAS
 --// ==========================================
 
 local OriginalStructures = {}
-local OriginalGraphics = settings().Rendering.QualityLevel
-local OriginalFogEnd = nil
-local OriginalFogStart = nil
-local OriginalStreamingMinRadius = nil
-local OriginalStreamingTargetRadius = nil
-local ViewBoostActive = false
+local StructureRecordByObject = setmetatable({}, { __mode = "k" })
 local optimizationConnection = nil
+local visibleSweepThread = nil
 local StructureHighlights = {}
 local LocateThread = nil
 local LOCATE_RADIUS = 100
-
-pcall(function() OriginalFogEnd = Lighting.FogEnd end)
-pcall(function() OriginalFogStart = Lighting.FogStart end)
-pcall(function() OriginalStreamingMinRadius = workspace.StreamingMinRadius end)
-pcall(function() OriginalStreamingTargetRadius = workspace.StreamingTargetRadius end)
+local VISIBLE_SWEEP_INTERVAL = 2.0
+local VISIBLE_SWEEP_YIELD_EVERY = 500
 
 local setOtimizacao, getOtimizacao
 
+-- Este FPS Boost não altera qualidade gráfica, neblina, streaming nem distância
+-- de visão. Ele atua somente ocultando localmente o cenário e removendo sombras.
 local function applyMaxViewDistance()
-    if ViewBoostActive then return end
-    ViewBoostActive = true
-
-    pcall(function() Lighting.FogStart = 1e8 end)
-    pcall(function() Lighting.FogEnd = 1e9 end)
-
-    pcall(function() workspace.StreamingMinRadius = 512 end)
-    pcall(function() workspace.StreamingTargetRadius = 10000 end)
-
-    pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level21 end)
+    -- Intencionalmente vazio: preservar os gráficos e a visão originais do jogo.
 end
 
 local function restoreViewDistance()
-    if not ViewBoostActive then return end
-    ViewBoostActive = false
-
-    if OriginalFogEnd then
-        pcall(function() Lighting.FogEnd = OriginalFogEnd end)
-    end
-    if OriginalFogStart then
-        pcall(function() Lighting.FogStart = OriginalFogStart end)
-    end
-    if OriginalStreamingMinRadius then
-        pcall(function() workspace.StreamingMinRadius = OriginalStreamingMinRadius end)
-    end
-    if OriginalStreamingTargetRadius then
-        pcall(function() workspace.StreamingTargetRadius = OriginalStreamingTargetRadius end)
-    end
-    pcall(function() settings().Rendering.QualityLevel = OriginalGraphics end)
+    -- Intencionalmente vazio: nenhuma configuração gráfica foi modificada.
 end
+
+local CHARACTER_NAME_HINTS = {
+    "npc", "mob", "enemy", "enemies", "monster", "boss", "paladin",
+    "skeleton", "zombie", "bandit", "goblin", "warrior", "guard",
+    "soldier", "creature", "character", "dummy", "minion", "undead",
+    "pirate", "knight", "merchant", "vendor", "shopkeeper", "questgiver",
+    "trainer", "raider", "beast", "demon", "savage", "slime", "orc",
+    "wolf", "bear", "sorcerer", "mage", "assassin", "archer", "villager"
+}
+
+local CHARACTER_CONTAINER_NAMES = {
+    npcs = true, npc = true, mobs = true, enemies = true, monsters = true,
+    characters = true, actors = true, creatures = true, livecharacters = true,
+    liveentities = true, hostilemobs = true,
+}
+
+-- Constantes fora de isGroundPart para evitar milhares de tabelas temporárias
+-- durante a varredura inicial do mapa.
+local GROUND_NAME_MIN_HORIZONTAL = {
+    baseplate = 8, mapground = 8, worldground = 8, terrain = 8,
+    ground = 12, groundpart = 12, grassground = 8, sandground = 8,
+    grass = 8, sand = 8, dirt = 8, earth = 12,
+    road = 12, asphalt = 12, path = 14, floor = 50, floorbase = 25,
+    mapfloor = 25, land = 20,
+}
+local GROUND_NAME_PREFIXES = {
+    { "baseplate", 8 }, { "mapground", 8 }, { "worldground", 8 },
+    { "ground", 12 }, { "sand", 8 }, { "grass", 8 }, { "dirt", 8 },
+    { "asphalt", 12 }, { "road", 12 }, { "path", 14 },
+}
+local GROUND_MATERIALS = {
+    ["Enum.Material.Grass"] = true,
+    ["Enum.Material.LeafyGrass"] = true,
+    ["Enum.Material.Sand"] = true,
+    ["Enum.Material.Ground"] = true,
+    ["Enum.Material.Mud"] = true,
+    ["Enum.Material.Asphalt"] = true,
+}
 
 local function isCharacterObject(obj)
     local current = obj
     while current and current ~= workspace do
+        local lowerName = string.lower(tostring(current.Name or ""))
+        local compactName = lowerName:gsub("[%s_%-]", "")
+
+        if current == player.Character then
+            return true
+        end
+        if CHARACTER_CONTAINER_NAMES[compactName] then
+            return true
+        end
         if current:IsA("Model") then
-            local humanoid = current:FindFirstChildOfClass("Humanoid")
-            if humanoid then
+            if current:FindFirstChildOfClass("Humanoid") then
                 return true
+            end
+            -- Protege mobs/NPCs que usem um modelo sem Humanoid.
+            for _, hint in ipairs(CHARACTER_NAME_HINTS) do
+                if compactName:find(hint, 1, true) then
+                    return true
+                end
             end
         end
         current = current.Parent
@@ -5573,47 +5444,39 @@ local function isCharacterObject(obj)
 end
 
 local function isGroundPart(part)
-    if not part:IsA("BasePart") then return false end
+    if not part or not part:IsA("BasePart") then return false end
 
-    local name = part.Name:lower()
-    local groundNames = {
-        "baseplate", "floor", "ground", "chão", "chao",
-        "grass", "grama", "terrain", "water", "água", "agua",
-        "sand", "areia", "road", "estrada", "asphalt", "asfalto",
-        "path", "caminho", "tile", "piso", "platform", "plataforma"
-    }
-    for _, pattern in ipairs(groundNames) do
-        if name:find(pattern, 1, true) then
-            return true
-        end
-    end
-
+    local name = string.lower(tostring(part.Name or "")):gsub("[%s_%-]", "")
     local size = part.Size
-    if size.Y < 3 and (size.X > 50 or size.Z > 50) then
-        return true
-    end
+    local horizontal = math.max(size.X, size.Z)
+    local thin = size.Y <= math.max(3, horizontal * 0.12)
 
-    return false
-end
-
-local function isIndicator(obj)
-    if not obj:IsA("BasePart") then return false end
-
-    local mat = obj.Material
-    if mat == Enum.Material.Neon or mat == Enum.Material.ForceField then
-        return true
-    end
-
-    local name = obj.Name:lower()
-    local indicatorNames = {
-        "range", "circle", "radius", "indicator", "hitbox",
-        "aura", "ring", "zone", "area", "marker", "highlight",
-        "visual", "effect", "glow", "outline", "selection"
-    }
-    for _, pattern in ipairs(indicatorNames) do
-        if name:find(pattern, 1, true) then
-            return true
+    -- Nomes de superfície só são aceitos quando a peça realmente parece uma
+    -- superfície horizontal fina; folhas e galhos chamados "Grass" não passam.
+    local minHorizontal = GROUND_NAME_MIN_HORIZONTAL[name]
+    if not minHorizontal then
+        -- Também reconhece nomes comuns de chão numerados, por exemplo Grass_1,
+        -- SandTile02 ou Ground_Part, sem tratar copa/galhos grossos como terreno.
+        for _, rule in ipairs(GROUND_NAME_PREFIXES) do
+            if name:find(rule[1], 1, true) then
+                minHorizontal = rule[2]
+                break
+            end
         end
+    end
+    if minHorizontal and horizontal >= minHorizontal and thin then
+        return true
+    end
+
+    -- Fallback para Baseplate/mapas que usam nomes genéricos.
+    if size.Y <= 2.5 and (size.X >= 150 or size.Z >= 150) then
+        return true
+    end
+
+    -- Uma superfície de terreno enorme pode não ter nome reconhecível.
+    local materialName = tostring(part.Material)
+    if GROUND_MATERIALS[materialName] and horizontal >= 100 and size.Y <= 3 then
+        return true
     end
 
     return false
@@ -5647,9 +5510,9 @@ local function removeAllHighlights()
 end
 
 local function updateHighlightsLoop()
-    if LocateThread then task.cancel(LocateThread) end
+    if LocateThread then pcall(task.cancel, LocateThread) end
     LocateThread = task.spawn(function()
-        while getLocateStructures and getLocateStructures() do
+        while getLocateStructures and getLocateStructures() and getOtimizacao and getOtimizacao() do
             local char = player.Character
             local root = char and char:FindFirstChild("HumanoidRootPart")
             local pos = root and root.Position
@@ -5668,47 +5531,69 @@ local function updateHighlightsLoop()
             end
             task.wait(0.5)
         end
+        LocateThread = nil
     end)
 end
 
-local function processStructure(obj)
-    if isCharacterObject(obj) or isIndicator(obj) then return end
+local function rememberAndHide(obj, data)
+    if StructureRecordByObject[obj] then return end
+    StructureRecordByObject[obj] = data
+    table.insert(OriginalStructures, data)
+end
 
-    if obj:IsA("BasePart") and not isGroundPart(obj) then
-        table.insert(OriginalStructures, {
+local function processStructure(obj)
+    if not obj or not obj.Parent then return end
+    if isCharacterObject(obj) then return end
+
+    if obj:IsA("BasePart") then
+        if isGroundPart(obj) then return end
+        if StructureRecordByObject[obj] then
+            -- Outra rotina pode ter alterado a peça depois do primeiro scan.
+            pcall(function()
+                obj.Transparency = 1
+                obj.LocalTransparencyModifier = 1
+                obj.CanCollide = false
+                obj.CastShadow = false
+            end)
+            return
+        end
+
+        local data = {
             obj = obj,
             type = "part",
             transparency = obj.Transparency,
+            localTransparencyModifier = obj.LocalTransparencyModifier,
             canCollide = obj.CanCollide,
-        })
-        obj.Transparency = 1
-        obj.CanCollide = false
+        }
+        rememberAndHide(obj, data)
+        pcall(function()
+            obj.Transparency = 1
+            obj.LocalTransparencyModifier = 1
+            obj.CanCollide = false
+            obj.CastShadow = false
+        end)
 
     elseif obj:IsA("Decal") or obj:IsA("Texture") then
         local parent = obj.Parent
-        local parentIsGround = parent and parent:IsA("BasePart") and isGroundPart(parent)
-        local parentIsChar = parent and isCharacterObject(parent)
-        if not parentIsGround and not parentIsChar then
-            table.insert(OriginalStructures, {
-                obj = obj,
-                type = "decal",
-                transparency = obj.Transparency,
-            })
-            obj.Transparency = 1
-        end
+        if parent and parent:IsA("BasePart") and isGroundPart(parent) then return end
+        if StructureRecordByObject[obj] then return end
+        rememberAndHide(obj, {
+            obj = obj,
+            type = "decal",
+            transparency = obj.Transparency,
+        })
+        pcall(function() obj.Transparency = 1 end)
 
     elseif obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
         local parent = obj.Parent
-        local parentIsGround = parent and parent:IsA("BasePart") and isGroundPart(parent)
-        local parentIsChar = parent and isCharacterObject(parent)
-        if not parentIsGround and not parentIsChar then
-            table.insert(OriginalStructures, {
-                obj = obj,
-                type = "gui",
-                enabled = obj.Enabled,
-            })
-            obj.Enabled = false
-        end
+        if parent and parent:IsA("BasePart") and isGroundPart(parent) then return end
+        if StructureRecordByObject[obj] then return end
+        rememberAndHide(obj, {
+            obj = obj,
+            type = "gui",
+            enabled = obj.Enabled,
+        })
+        pcall(function() obj.Enabled = false end)
     end
 end
 
@@ -5719,39 +5604,52 @@ local ShadowState = {
     Connection = nil,
 }
 
+local function recordAndDisableShadow(part)
+    if not part or not part:IsA("BasePart") then return end
+    if ShadowState.Parts[part] == nil then
+        ShadowState.Parts[part] = part.CastShadow
+    end
+    if part.CastShadow then
+        pcall(function() part.CastShadow = false end)
+    end
+end
+
 local function removeAllShadows()
     pcall(function()
-        ShadowState.GlobalShadows = Lighting.GlobalShadows
+        if ShadowState.GlobalShadows == nil then
+            ShadowState.GlobalShadows = Lighting.GlobalShadows
+        end
         Lighting.GlobalShadows = false
     end)
 
-    ShadowState.Parts = setmetatable({}, { __mode = "k" })
-    local count = 0
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") and obj.CastShadow then
-            ShadowState.Parts[obj] = true
-            obj.CastShadow = false
-            count = count + 1
-            if count % 500 == 0 then
-                task.wait()
-            end
-        end
-    end
-
     if ShadowState.Connection then
         ShadowState.Connection:Disconnect()
+        ShadowState.Connection = nil
     end
+    -- Conecta antes do scan para também capturar peças que apareçam durante ele.
     ShadowState.Connection = workspace.DescendantAdded:Connect(function(obj)
         if not obj:IsA("BasePart") then return end
         task.defer(function()
-            if obj.Parent and obj.CastShadow and getOtimizacao and getOtimizacao() then
-                ShadowState.Parts[obj] = true
-                obj.CastShadow = false
+            if obj.Parent and getOtimizacao and getOtimizacao() then
+                recordAndDisableShadow(obj)
             end
         end)
     end)
 
-    print(("[RAMDOM HUB] Sombras removidas em %d partes"):format(count))
+    local count = 0
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if not (getOtimizacao and getOtimizacao()) then
+            return
+        end
+        if obj:IsA("BasePart") then
+            recordAndDisableShadow(obj)
+            count = count + 1
+            if count % 500 == 0 then task.wait() end
+        end
+    end
+
+    if not (getOtimizacao and getOtimizacao()) then return end
+    print(("[RAMDOM HUB] Sombras desativadas em %d partes"):format(count))
 end
 
 local function restoreAllShadows()
@@ -5760,55 +5658,87 @@ local function restoreAllShadows()
         ShadowState.Connection = nil
     end
 
-    for part in pairs(ShadowState.Parts) do
+    for part, originalValue in pairs(ShadowState.Parts) do
         pcall(function()
             if part and part.Parent then
-                part.CastShadow = true
+                part.CastShadow = originalValue
             end
         end)
     end
     ShadowState.Parts = setmetatable({}, { __mode = "k" })
 
     if ShadowState.GlobalShadows ~= nil then
-        pcall(function()
-            Lighting.GlobalShadows = ShadowState.GlobalShadows
-        end)
+        pcall(function() Lighting.GlobalShadows = ShadowState.GlobalShadows end)
         ShadowState.GlobalShadows = nil
     end
     print("[RAMDOM HUB] Sombras restauradas!")
 end
---// =============================================
+
+local function isInCameraView(part)
+    local camera = workspace.CurrentCamera
+    if not camera or not part or not part.Parent then return false end
+    local ok, projected, onScreen = pcall(function()
+        local point, visible = camera:WorldToViewportPoint(part.Position)
+        return point, visible
+    end)
+    return ok and projected and onScreen and projected.Z > 0
+end
+
+local function startVisibleStructureSweep()
+    if visibleSweepThread then return end
+    visibleSweepThread = task.spawn(function()
+        while getOtimizacao and getOtimizacao() do
+            local descendants = workspace:GetDescendants()
+            for index, obj in ipairs(descendants) do
+                if not (getOtimizacao and getOtimizacao()) then break end
+                if obj:IsA("BasePart")
+                    and not StructureRecordByObject[obj]
+                    and not isCharacterObject(obj)
+                    and not isGroundPart(obj)
+                    and isInCameraView(obj) then
+                    processStructure(obj)
+                end
+                if index % VISIBLE_SWEEP_YIELD_EVERY == 0 then
+                    task.wait()
+                end
+            end
+            task.wait(VISIBLE_SWEEP_INTERVAL)
+        end
+        visibleSweepThread = nil
+    end)
+end
 
 local function hideStructures()
     if optimizationConnection then
         optimizationConnection:Disconnect()
         optimizationConnection = nil
     end
+    if visibleSweepThread then
+        pcall(task.cancel, visibleSweepThread)
+        visibleSweepThread = nil
+    end
 
     OriginalStructures = {}
-    local descendants = workspace:GetDescendants()
-    local count = 0
+    StructureRecordByObject = setmetatable({}, { __mode = "k" })
 
-    for _, obj in ipairs(descendants) do
+    -- Conecta primeiro para não perder estruturas que apareçam enquanto o scan inicial roda.
+    optimizationConnection = workspace.DescendantAdded:Connect(function(obj)
+        task.delay(0.25, function()
+            if getOtimizacao and getOtimizacao() and obj and obj.Parent then
+                processStructure(obj)
+            end
+        end)
+    end)
+
+    local descendants = workspace:GetDescendants()
+    for index, obj in ipairs(descendants) do
         if not (getOtimizacao and getOtimizacao()) then break end
-        
         processStructure(obj)
-        count = count + 1
-        
-        if count % 500 == 0 then
-            task.wait()
-        end
+        if index % 500 == 0 then task.wait() end
     end
 
     if getOtimizacao and getOtimizacao() then
-        optimizationConnection = workspace.DescendantAdded:Connect(function(obj)
-            task.spawn(function()
-                task.wait(0.1)
-                if getOtimizacao and getOtimizacao() then
-                    processStructure(obj)
-                end
-            end)
-        end)
+        startVisibleStructureSweep()
     end
     print(("[RAMDOM HUB] Estruturas escondidas: %d objetos"):format(#OriginalStructures))
 end
@@ -5818,7 +5748,10 @@ local function restoreStructures()
         optimizationConnection:Disconnect()
         optimizationConnection = nil
     end
-
+    if visibleSweepThread then
+        pcall(task.cancel, visibleSweepThread)
+        visibleSweepThread = nil
+    end
     if LocateThread then
         pcall(task.cancel, LocateThread)
         LocateThread = nil
@@ -5830,6 +5763,7 @@ local function restoreStructures()
             if data.obj and data.obj.Parent then
                 if data.type == "part" then
                     data.obj.Transparency = data.transparency
+                    data.obj.LocalTransparencyModifier = data.localTransparencyModifier or 0
                     data.obj.CanCollide = data.canCollide
                 elseif data.type == "decal" then
                     data.obj.Transparency = data.transparency
@@ -5840,6 +5774,7 @@ local function restoreStructures()
         end)
     end
     OriginalStructures = {}
+    StructureRecordByObject = setmetatable({}, { __mode = "k" })
     print("[RAMDOM HUB] Estruturas restauradas!")
 end
 
@@ -5855,17 +5790,23 @@ local function waitAndHide(stateChecker)
         pcall(function()
             StarterGui:SetCore("SendNotification", {
                 Title = "Fps Boost",
-                Text = "Visão máxima ativada + apagando estruturas instantaneamente...",
+                Text = "Removendo estruturas do cenário e desativando sombras...",
                 Duration = 3,
             })
         end)
 
         if stateChecker() then
             hideStructures()
-            removeAllShadows()
-            if getLocateStructures and getLocateStructures() then
+            if stateChecker() then
+                removeAllShadows()
+            end
+            if stateChecker() and getLocateStructures and getLocateStructures() then
                 updateHighlightsLoop()
             end
+        else
+            restoreStructures()
+            restoreAllShadows()
+            restoreViewDistance()
         end
 
         optimizationLoading = false
@@ -5892,7 +5833,7 @@ setOtimizacao, getOtimizacao = createToggleCard(
     end
 )
 
--- ✅ Toggle: Localizar Estruturas
+-- Toggle opcional para destacar localmente as estruturas já escondidas.
 local setLocate, getLocate = createToggleCard(
     ConfigScroll,
     4,
@@ -5923,6 +5864,7 @@ local setLocate, getLocate = createToggleCard(
 )
 setLocateStructures = setLocate
 getLocateStructures = getLocate
+
 
 --// ==========================================
 --// UI PEQUENA (Botão 🎲)
@@ -5992,11 +5934,6 @@ local function destroyScript()
     restoreAllShadows()
     restoreViewDistance()
     stopAntiAFK()
-    pcall(function()
-        settings().Rendering.QualityLevel = OriginalGraphics
-    end)
-    if OriginalFogEnd then pcall(function() Lighting.FogEnd = OriginalFogEnd end) end
-    if OriginalFogStart then pcall(function() Lighting.FogStart = OriginalFogStart end) end
 end
 
 _G.__RamdomHubStop = destroyScript
@@ -6043,7 +5980,7 @@ tween(Main, {Size = CONFIG.UISize, Position = CONFIG.UIOffset}, 0.35, Enum.Easin
 pcall(function()
     StarterGui:SetCore("SendNotification", {
         Title = "RAMDOM HUB v" .. CONFIG.Version,
-        Text = "Fps Boost agora vê o mapa inteiro e apaga tudo instantaneamente!",
+        Text = "FPS Boost: cenário ocultado localmente; gráficos e distância de visão preservados!",
         Duration = 5,
     })
 end)
