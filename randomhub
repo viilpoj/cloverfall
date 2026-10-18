@@ -4876,4 +4876,4 @@ pcall(function()
         Text = "Fps Boost agora vê o mapa inteiro e apaga tudo instantaneamente!",
         Duration = 5,
     })
-end)s
+end)
