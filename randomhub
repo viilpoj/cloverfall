@@ -1,12 +1,15 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.2                     ║
+    ║                 RAMDOM HUB  v1.3                     ║
     ║ Combat, Home, Auto Farm, Auto Minner, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v1.2:
+    v1.3:
+      + Auto Farm Melhorado (recuperação de obstáculo com timeout)
       + Melhoria no Fps Boost
-      + Melhoria no Auto Minner
+      + Fps Boost NÃO diminui a distância de visão — agora vê o mapa inteiro
+        (FogEnd/FogStart altos + streaming máximo + qualidade alta)
+      + Fps Boost apaga tudo acima do chão instantaneamente
       + Auto Equip: slots 1-0 selecionáveis sempre, mas só equipa com toggle ON
       + Fps Boost movido para Config
       + Noclip removido
@@ -44,7 +47,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.2",
+    Version = "1.3",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -69,6 +72,12 @@ local MOB_CFG = {
     GiveUpTime = 12,             
     IgnoreTime = 20,             
     TickRate = 0.1,              
+    ObstacleRayDistance = 5.5,
+    ObstacleJumpTrigger = 0.8,
+    ObstacleJumpInterval = 0.15,
+    ObstacleJumpClearDelay = 0.6,
+    ObstacleJumpMinProgress = 1.2,
+    ObstacleJumpMaxTime = 8,
     AnyWhenNoSelection = true,   
     AttackOnlySelected = true,   
     HoldShiftWhileMoving = true, 
@@ -102,9 +111,8 @@ local MINER_CFG = {
     SearchRadius = 800,          
     MaxOreSize = 40,             
     UseAppearance = false,       
-    -- Reject ores whose main orientation is sideways or upside down.
     RequireUprightOres = true,
-    MinOreUpDot = 0.75,           -- 1 = perfectly upright; 0 = sideways; -1 = upside down.
+    MinOreUpDot = 0.75,
     OrientationIgnoreTime = 60,
     CrystalMinSize = 0.8,
     CrystalMaxSize = 14,
@@ -122,10 +130,8 @@ local MINER_CFG = {
     ReachBuffer = 4,             
     ClickDelay = 0.5,            
     FirstClickVerifyDelay = 0.5,  
-    -- Don't abandon an ore just because its model doesn't shrink after one or two hits.
     NoProgressMinClicks = 15,
     NoProgressGraceTime = 7.5,
-    -- Transparency alone is weak evidence of destruction; require stable invisibility after several hits.
     HiddenDestroyConfirmTime = 2.75,
     HiddenDestroyMinClicks = 4,
     MineTimeout = 25,            
@@ -178,7 +184,7 @@ local AutoMiner = {
 --// ==========================================
 local CombatCfg = {
     AutoAttackEnabled = false,
-    AttackDelay = 0.10,          
+    AttackDelay = 0.4,           
     AttackRange = 15,            
     AttackScanInterval = 0.2,    
     ClickVIM = true,             
@@ -362,6 +368,45 @@ local function clickOnce(singleBackend)
             VirtualUser:Button1Up(p, cf)
         end)
         clicked = clicked or ok
+    end
+
+    return clicked
+end
+
+--// Clique exclusivo do Auto Attack: centro horizontal, região superior da tela.
+--// O Auto Miner continua usando clickOnce() e sua posição segura original.
+local function autoAttackClickOffscreen()
+    local cam = workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+    local p = Vector2.new(vp.X * 0.5, vp.Y * 0.10)
+    local clicked = false
+
+    if CombatCfg.ClickVIM then
+        local downOk = pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+        end)
+        if downOk then
+            clicked = true
+            task.wait(0.015)
+            pcall(function()
+                VirtualInputManager:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
+            end)
+        end
+    end
+
+    if CombatCfg.ClickVirtualUser and not clicked then
+        local cf = cam and cam.CFrame or CFrame.new()
+        local downOk = pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:Button1Down(p, cf)
+        end)
+        if downOk then
+            clicked = true
+            task.wait(0.015)
+            pcall(function()
+                VirtualUser:Button1Up(p, cf)
+            end)
+        end
     end
 
     return clicked
@@ -847,6 +892,38 @@ do
         root.CFrame = CFrame.lookAt(root.Position, Vector3.new(pos.X, root.Position.Y, pos.Z))
     end
 
+    local function hasObstacleAhead(root, targetRoot, targetModel)
+        local towardTarget = Vector3.new(
+            targetRoot.Position.X - root.Position.X,
+            0,
+            targetRoot.Position.Z - root.Position.Z
+        )
+        if towardTarget.Magnitude < 1 then return false end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { player.Character, targetModel }
+        params.RespectCanCollide = true
+
+        local direction = towardTarget.Unit
+        local rayLength = math.min(MOB_CFG.ObstacleRayDistance, towardTarget.Magnitude)
+
+        local function isSolidObstacle(hit)
+            if not hit then return false end
+            local hitModel = hit.Instance:FindFirstAncestorOfClass("Model")
+            if hitModel and hitModel:FindFirstChildOfClass("Humanoid") then
+                return false
+            end
+            return true
+        end
+
+        local lowOrigin = root.Position + Vector3.new(0, 0.25, 0)
+        local highOrigin = root.Position + Vector3.new(0, 1.5, 0)
+        local lowHit = workspace:Raycast(lowOrigin, direction * rayLength, params)
+        local highHit = workspace:Raycast(highOrigin, direction * rayLength, params)
+        return isSolidObstacle(lowHit) or isSolidObstacle(highHit)
+    end
+
     local function chase(mob, token)
         local mr0 = modelRoot(mob)
         local reach = MOB_CFG.StopDistance + getMobRadius(mob, mr0)
@@ -861,6 +938,10 @@ do
         local bestDist = math.huge
         local engaged = false          
         local lastCheck, lastPos, stuck = t0, nil, 0
+        local jumpRecovery = false
+        local jumpRecoveryStartedAt = 0
+        local jumpRecoveryStartPos = nil
+        local lastRecoveryJumpAt = 0
         local selVersion = AutoMob.SelectionVersion
         local reason = "fim"
 
@@ -920,10 +1001,16 @@ do
                     hum:MoveTo(root.Position)
                     faceTo(root, mr.Position)
                     stuck, lastPos = 0, nil
+                    jumpRecovery = false
+                    jumpRecoveryStartPos = nil
                     lastNear, progressAt, bestDist = now, now, dist
                 else
                     setMoving(true)
-                    setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
+                    if jumpRecovery then
+                        setStatus("pulando para passar do obstáculo...")
+                    else
+                        setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
+                    end
                     hum:MoveTo(mr.Position)
 
                     if dist < bestDist - 1.5 then
@@ -941,11 +1028,56 @@ do
                         end
                         lastPos, lastCheck = root.Position, now
                     end
-                    if stuck > 1 then
+
+                    local obstacleAhead = false
+                    if jumpRecovery or stuck >= MOB_CFG.ObstacleJumpTrigger then
+                        obstacleAhead = hasObstacleAhead(root, mr, mob)
+                    end
+
+                    if not jumpRecovery and stuck >= MOB_CFG.ObstacleJumpTrigger and obstacleAhead then
+                        jumpRecovery = true
+                        jumpRecoveryStartedAt = now
+                        jumpRecoveryStartPos = root.Position
+                        lastRecoveryJumpAt = 0
+                        setStatus("obstáculo detectado; pulando para passar...")
+                    end
+
+                    if jumpRecovery then
+                        local startPos = jumpRecoveryStartPos or root.Position
+                        local horizontalProgress = Vector3.new(
+                            root.Position.X - startPos.X,
+                            0,
+                            root.Position.Z - startPos.Z
+                        ).Magnitude
+                        local recoveryAge = now - jumpRecoveryStartedAt
+
+                        if recoveryAge >= MOB_CFG.ObstacleJumpClearDelay
+                            and horizontalProgress >= MOB_CFG.ObstacleJumpMinProgress
+                            and not obstacleAhead then
+                            jumpRecovery = false
+                            jumpRecoveryStartPos = nil
+                            stuck = 0
+                            lastPos = root.Position
+                            lastCheck = now
+                            progressAt = now
+                            lastNear = now
+                            bestDist = dist
+                        elseif now - lastRecoveryJumpAt >= MOB_CFG.ObstacleJumpInterval then
+                            pcall(function()
+                                hum.Jump = true
+                                hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                            end)
+                            lastRecoveryJumpAt = now
+                        end
+                    elseif stuck > 1 then
                         hum.Jump = true
                     end
 
-                    if now - progressAt > MOB_CFG.GiveUpTime or now - lastNear > nearLimit then
+                    local giveUpByJump = jumpRecovery
+                        and (now - jumpRecoveryStartedAt > MOB_CFG.ObstacleJumpMaxTime)
+                    if giveUpByJump
+                        or (not jumpRecovery and (now - progressAt > MOB_CFG.GiveUpTime
+                            or now - lastNear > nearLimit)) then
                         reason = "inalcancavel"
                         break
                     end
@@ -955,6 +1087,8 @@ do
             end
         end
 
+        jumpRecovery = false
+        jumpRecoveryStartPos = nil
         steerPart = nil
         return reason
     end
@@ -1496,7 +1630,6 @@ do
             end
         end
 
-        -- A resource-looking part inside a wall, shop, decoration, or NPC container is not a mine target.
         local ancestor = d.Parent
         local ancestorDepth = 0
         while ancestor and ancestor ~= workspace and ancestorDepth < 6 do
@@ -1671,9 +1804,6 @@ do
         return parts
     end
 
-    -- For a BasePart this checks its actual CFrame. For a Model, getBox()
-    -- returns the model/PrimaryPart-oriented bounding box, which detects when
-    -- the whole resource has been rotated onto its side or upside down.
     local function isNormallyOriented(inst, boxCf)
         if not MINER_CFG.RequireUprightOres then
             return true
@@ -2075,79 +2205,6 @@ do
         return nil, stats
     end
 
-    local function findNearbyBetterTarget(root, currentInfo, token)
-        local params = OverlapParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = player.Character and { player.Character } or {}
-        pcall(function() params.MaxParts = 180 end)
-        local okQuery, parts = pcall(function()
-            return workspace:GetPartBoundsInRadius(root.Position, MINER_CFG.NearbyScanRadius, params)
-        end)
-        if not okQuery or not parts then return nil end
-
-        local seen, candidates = {}, {}
-        for _, part in ipairs(parts) do
-            local cur = part
-            local chosen = nil
-            local depth = 0
-            while cur and cur ~= workspace and depth < 6 do
-                if cur:IsA("Model") or cur:IsA("BasePart") then
-                    local kind = classify(cur)
-                    if kind then chosen = { Inst = cur, Kind = kind } end
-                end
-                cur = cur.Parent
-                depth = depth + 1
-            end
-            local relatedToCurrent = false
-            if chosen and chosen.Inst then
-                pcall(function()
-                    relatedToCurrent = chosen.Inst == currentInfo.Inst
-                        or chosen.Inst:IsDescendantOf(currentInfo.Inst)
-                        or currentInfo.Inst:IsDescendantOf(chosen.Inst)
-                end)
-            end
-            if chosen and chosen.Inst and not relatedToCurrent and not seen[chosen.Inst] then
-                seen[chosen.Inst] = true
-                local oreType = getOreType(chosen.Inst, chosen.Kind)
-                local ignoredUntil = rejected[chosen.Inst]
-                if not ignoredUntil or ignoredUntil <= os.clock() then
-                    local posOK, pos = pcall(function()
-                        if chosen.Inst:IsA("BasePart") then return chosen.Inst.Position end
-                        local cf = chosen.Inst:GetBoundingBox()
-                        return cf.Position
-                    end)
-                    if posOK and pos and not isBlocked(pos, os.clock()) then
-                        table.insert(candidates, { Inst = chosen.Inst, Kind = chosen.Kind, OreType = oreType, Pos = pos, Dist = (pos - root.Position).Magnitude })
-                    end
-                end
-            end
-        end
-        table.sort(candidates, function(a, b) return a.Dist < b.Dist end)
-
-        local currentDist = (root.Position - currentInfo.Center).Magnitude
-        local evaluated = 0
-        for _, candidate in ipairs(candidates) do
-            if not isActive(token) then return nil end
-            if candidate.Dist + MINER_CFG.TargetSwitchMargin < currentDist then
-                local info = evaluate(candidate.Inst)
-                evaluated = evaluated + 1
-                if info then
-                    info.OreType = candidate.OreType
-                    if checkReachable(info, root) then
-                        dbg("alvo próximo encontrado:", info.Name, "[" .. tostring(info.OreType) .. "]")
-                        return info
-                    else
-                        rejected[candidate.Inst] = os.clock() + MINER_CFG.IgnoreTime
-                    end
-                end
-                if evaluated >= 3 then break end
-            else
-                break
-            end
-        end
-        return nil
-    end
-
     local function hasDepletedFlag(inst)
         if not inst then return false end
         local objects = { inst }
@@ -2229,16 +2286,10 @@ do
             local now = os.clock()
             info.HiddenSince = info.HiddenSince or now
             local hiddenFor = now - info.HiddenSince
-            -- If most of the original model parts were actually removed, accept only
-            -- after the structural change remains stable briefly.
             if substantialRemoval and hiddenFor >= 0.9 then
                 return true, "maioria das partes removida"
             end
 
-            -- Some games leave mined resources in Workspace with Transparency = 1.
-            -- Do not confuse a short hit/respawn animation with destruction: this
-            -- fallback is allowed only during mining, after multiple click attempts,
-            -- and only when invisibility has remained stable long enough.
             local hitCount = tonumber(info.ClickAttempts) or 0
             if info.MiningStarted == true
                 and hitCount >= MINER_CFG.HiddenDestroyMinClicks
@@ -2482,11 +2533,9 @@ do
 
             if not nudged and os.clock() - lastRecoveryJumpAt >= MINER_CFG.RecoveryJumpCooldown then
                 lastRecoveryJumpAt = os.clock()
-                -- One short Space press per recovery attempt; never hold it during normal movement.
                 tapSpace()
                 local _, jumpHum, jumpRoot = getChar()
                 if jumpHum and jumpRoot then
-                    -- Humanoid fallback complements the explicit Space key tap if input simulation is restricted.
                     pcall(function() jumpHum.Jump = true end)
                     local jumpDestination = info.StandPoint or info.Center
                     pcall(function() jumpHum:MoveTo(jumpDestination) end)
@@ -2501,7 +2550,6 @@ do
                 return false
             end
 
-            -- Always rebuild from the real current position, not from the old route's origin.
             local destination = info.StandPoint or info.Center
             local okPath, newWps = computePath(currentRoot.Position, destination)
             if okPath and newWps and #newWps > 0 then
@@ -2521,7 +2569,6 @@ do
 
             if not okPath then
                 dbg("rota alternativa não encontrada após recuperação", recoveryAttempts)
-                -- Keep a bounded direct MoveTo fallback while the remaining recovery attempts run.
                 waypoints = nil
                 idx = 1
                 plannedCenter = info.Center
@@ -2555,7 +2602,6 @@ do
                 break
             end
 
-            -- Revalidate the selected instance before moving; stale cache entries must not become targets.
             local _, hum, root = getChar()
             if not (info.Inst and info.Inst.Parent and info.Inst:IsDescendantOf(workspace)
                 and classify(info.Inst)) then
@@ -2572,7 +2618,6 @@ do
                 local flat = horizontal(root.Position, info.Center)
                 local stand = info.StandPoint or info.GroundPos or info.Center
                 local standFlat = horizontal(root.Position, stand)
-                -- StandPoint is a ground position. The root part normally sits a few studs above it.
                 local standVerticalError = math.abs(root.Position.Y - (stand.Y + 3))
 
                 if standFlat <= MINER_CFG.WalkStopDistance
@@ -2581,7 +2626,6 @@ do
                     break
                 end
 
-                -- Refresh target geometry at a modest rate to follow moved ores without rescanning every frame.
                 if now - lastTargetRefresh >= MINER_CFG.TargetPositionRefreshInterval then
                     lastTargetRefresh = now
                     local boxOk, boxCf, boxSize = pcall(function()
@@ -2695,7 +2739,6 @@ do
                             result = "inalcancavel"
                             break
                         end
-                        -- Failed path checks still consume a bounded attempt; retry from the new position.
                         task.wait(0.15)
                     end
                 end
@@ -2723,8 +2766,6 @@ do
         local firstClickSignature = nil
         info.MiningStarted = true
         info.ClickAttempts = 0
-        -- Start the invisibility timer fresh; an ore may have been hidden briefly
-        -- while the character was still walking toward it.
         info.HiddenSince = nil
 
         while isActive(token) do
@@ -2740,8 +2781,6 @@ do
                 break
             end
 
-            -- The ore may rotate after the walking phase; do not click it if it
-            -- is no longer upright when mining begins or continues.
             local currentBoxCf = select(1, getBox(info.Inst))
             if not isNormallyOriented(info.Inst, currentBoxCf) then
                 rejected[info.Inst] = os.clock() + MINER_CFG.OrientationIgnoreTime
@@ -2761,19 +2800,13 @@ do
             if firstClickPending and now >= firstClickDeadline then
                 local afterSignature = getVisualSignature(info.Inst)
                 if visualSizeDecreased(firstClickSignature, afterSignature) then
-                    -- A visible change proves this target is responding; continue
-                    -- mining until destruction/inventory evidence confirms completion.
                     firstClickPending = false
                 elseif clickAttempts >= MINER_CFG.NoProgressMinClicks
                     and firstClickAt and now - firstClickAt >= MINER_CFG.NoProgressGraceTime then
-                    -- Only reject after many attempts over a grace period. Earlier
-                    -- versions stopped after the first unsuccessful visual check.
                     result = "sem-progresso-mineracao"
                     why = "sem alteração visual após várias tentativas"
                     break
                 else
-                    -- Keep delivering clicks while waiting for a visual response.
-                    -- The deadline is just a polling point, not a reason to stop.
                     firstClickDeadline = now + MINER_CFG.FirstClickVerifyDelay
                 end
             end
@@ -2983,7 +3016,6 @@ do
         end)
     end
 
-    -- Mapeia slot lógico → KeyCode. Slot 10 corresponde à tecla 0.
     local function pressSlotKey(slot)
         local keyMap = {
             [1] = Enum.KeyCode.One,
@@ -3025,7 +3057,6 @@ do
         end)
     end
 
-    -- equipSlot: apenas SALVA a seleção. Se o toggle estiver ligado, equipa de imediato.
     local function equipSlot(slot)
         if CombatCfg.EquipThread then
             task.cancel(CombatCfg.EquipThread)
@@ -3040,7 +3071,6 @@ do
 
         CombatCfg.SelectedSlot = slot
 
-        -- Só equipa agora se o toggle estiver ativo
         if CombatCfg.AutoEquipEnabled then
             pressSlotKey(slot)
             task.delay(0.3, function()
@@ -3053,12 +3083,10 @@ do
         end
     end
 
-    -- setAutoEquip: NÃO limpa mais SelectedSlot/LastEquippedTool ao desligar
     local function setAutoEquip(state)
         CombatCfg.AutoEquipEnabled = state
         if state then
             if CombatCfg.SelectedSlot and CombatCfg.SelectedSlot > 0 then
-                -- Toggle ligou com slot já selecionado: equipa agora e inicia loop
                 pressSlotKey(CombatCfg.SelectedSlot)
                 task.delay(0.3, function()
                     local char = player.Character
@@ -3073,7 +3101,6 @@ do
                 task.cancel(CombatCfg.EquipThread)
                 CombatCfg.EquipThread = nil
             end
-            -- Mantém CombatCfg.SelectedSlot e LastEquippedTool intactos
         end
     end
 
@@ -3104,7 +3131,7 @@ do
                     end
 
                     if mobNear then
-                        pcall(clickOnce)
+                        pcall(autoAttackClickOffscreen)
                         task.wait(CombatCfg.AttackDelay)
                     else
                         task.wait(0.05)
@@ -3179,7 +3206,6 @@ local UIScaleInstance = Instance.new("UIScale")
 UIScaleInstance.Scale = CONFIG.UIScale
 UIScaleInstance.Parent = Main
 
---// Header
 local HEADER_H = 72
 local Header = Instance.new("Frame")
 Header.Name = "Header"
@@ -3333,7 +3359,6 @@ SidebarPad.PaddingLeft = UDim.new(0, 8)
 SidebarPad.PaddingRight = UDim.new(0, 8)
 SidebarPad.Parent = Sidebar
 
---// Content Holder
 local ContentHolder = Instance.new("Frame")
 ContentHolder.Name = "ContentHolder"
 ContentHolder.Size = UDim2.new(1, -(SIDEBAR_W + 48), 1, -(HEADER_H + 24))
@@ -3343,7 +3368,6 @@ ContentHolder.ClipsDescendants = true
 ContentHolder.ZIndex = 2
 ContentHolder.Parent = Main
 
---// Páginas
 local Pages = {}
 local Tabs = {}
 
@@ -3371,7 +3395,6 @@ local AutoMobsPage = createPage("AutoMobs")
 local AutoMinerPage = createPage("AutoMiner")
 local ConfigPage = createPage("Config")
 
--- Página Config vira scroll (agrupa Config + Fps Boost)
 do
     local oldLayout = ConfigPage:FindFirstChildOfClass("UIListLayout")
     if oldLayout then oldLayout:Destroy() end
@@ -3397,7 +3420,6 @@ ConfigScrollLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(funct
     ConfigScroll.CanvasSize = UDim2.new(0, 0, 0, ConfigScrollLayout.AbsoluteContentSize.Y + 8)
 end)
 
---// Botões da aba
 local function createTabButton(id, label, order)
     local btn = Instance.new("TextButton")
     btn.Name = "Tab_" .. id
@@ -3526,7 +3548,6 @@ local function createUpdateCard(parent, layoutOrder, titleText, descText, custom
     return card
 end
 
--- ✅ Botão Join Discord
 local DiscordCard = Instance.new("Frame")
 DiscordCard.Name = "DiscordCard"
 DiscordCard.Size = UDim2.new(1, 0, 0, 56)
@@ -3575,13 +3596,12 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v1.2", "+ Melhoria no Fps Boost\n+ Melhoria no Auto Minner", 100)
+createUpdateCard(HomePage, 2, "v1.3", "+ Melhoria no Auto Farm\n+ Melhoria no Fps Boost", 100)
 
 --// ==========================================
 --// ABA COMBAT
 --// ==========================================
 
--- ✅ Card de Auto Equip (slots 1-9 e 0 selecionáveis sempre)
 local EquipCard = Instance.new("Frame")
 EquipCard.Name = "EquipCard"
 EquipCard.Size = UDim2.new(1, 0, 0, 110)
@@ -3604,7 +3624,6 @@ EquipTitle.TextSize = 14
 EquipTitle.TextXAlignment = Enum.TextXAlignment.Left
 EquipTitle.Parent = EquipCard
 
--- Toggle do Auto Equip
 local equipToggle = Instance.new("TextButton")
 equipToggle.Size = UDim2.new(0, 52, 0, 28)
 equipToggle.Position = UDim2.new(1, -68, 0, 8)
@@ -3644,7 +3663,6 @@ local function setEquipState(state)
         equipTrackGrad.Color = TOGGLE_OFF
         equipTrackStroke.Transparency = 0.3
         tween(equipKnob, {Position = UDim2.new(0, 3, 0.5, -11)}, 0.18)
-        -- NÃO limpa a seleção visual ao desligar o toggle
     end
     if _G.CombatToggleEquip then _G.CombatToggleEquip(state) end
 end
@@ -3665,8 +3683,6 @@ SlotsLayout.SortOrder = Enum.SortOrder.LayoutOrder
 SlotsLayout.Padding = UDim.new(0, 5)
 SlotsLayout.Parent = SlotsFrame
 
--- Slots visíveis: 1..9 e 0 (slot 10 = KeyCode.Zero)
--- Sempre clicáveis. Só equipam de fato com o toggle ligado.
 local SLOT_VALUES = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }
 
 for i, slotNum in ipairs(SLOT_VALUES) do
@@ -3688,7 +3704,6 @@ for i, slotNum in ipairs(SLOT_VALUES) do
     slotButtons[slotNum] = btn
 
     btn.MouseButton1Click:Connect(function()
-        -- SEMPRE pode selecionar (mesmo com toggle OFF)
         if selectedSlot == slotNum then
             selectedSlot = nil
             btn.BackgroundColor3 = Theme.BgSecondary
@@ -3709,7 +3724,6 @@ for i, slotNum in ipairs(SLOT_VALUES) do
     end)
 end
 
--- ✅ Card de Auto Skill
 local SkillCard = Instance.new("Frame")
 SkillCard.Name = "SkillCard"
 SkillCard.Size = UDim2.new(1, 0, 0, 120)
@@ -3819,7 +3833,6 @@ for i, data in ipairs(SKILL_KEYS) do
     end)
 end
 
--- ✅ Toggle de Auto Attack
 local setAutoAttack, getAutoAttack = createToggleCard(
     CombatPage,
     3,
@@ -3870,7 +3883,6 @@ AutoMob.OnStatus = function(text)
     MobStatus.Text = "Status: " .. text
 end
 
--- ✅ Card de Seleção de Mob (com info elegante)
 do
     local MobSelectCard = Instance.new("Frame")
     MobSelectCard.Name = "MobSelectCard"
@@ -3908,7 +3920,6 @@ do
     addCorner(ClearBtn, 6)
     addGradient(ClearBtn, Theme.Accent2, Theme.Accent1, 0)
 
-    -- ✅ Info elegante abaixo do título
     local MobInfo = Instance.new("Frame")
     MobInfo.Name = "MobInfo"
     MobInfo.Size = UDim2.new(1, -32, 0, 36)
@@ -4038,7 +4049,6 @@ setAutoMiner, getAutoMiner = createToggleCard(
     end
 )
 
--- ✅ Card de informação elegante abaixo do Auto Miner
 local MinerInfoCard = Instance.new("Frame")
 MinerInfoCard.Name = "MinerInfoCard"
 MinerInfoCard.Size = UDim2.new(1, 0, 0, 68)
@@ -4170,7 +4180,6 @@ UserInputService.InputEnded:Connect(function(i)
     end
 end)
 
--- ✅ Anti-AFK
 local setAntiAFK, getAntiAFK = createToggleCard(
     ConfigScroll,
     2,
@@ -4192,12 +4201,54 @@ startAntiAFK()
 
 local OriginalStructures = {}
 local OriginalGraphics = settings().Rendering.QualityLevel
+local OriginalFogEnd = nil
+local OriginalFogStart = nil
+local OriginalStreamingMinRadius = nil
+local OriginalStreamingTargetRadius = nil
+local ViewBoostActive = false
 local optimizationConnection = nil
 local StructureHighlights = {}
 local LocateThread = nil
 local LOCATE_RADIUS = 100
 
+pcall(function() OriginalFogEnd = Lighting.FogEnd end)
+pcall(function() OriginalFogStart = Lighting.FogStart end)
+pcall(function() OriginalStreamingMinRadius = workspace.StreamingMinRadius end)
+pcall(function() OriginalStreamingTargetRadius = workspace.StreamingTargetRadius end)
+
 local setOtimizacao, getOtimizacao
+
+local function applyMaxViewDistance()
+    if ViewBoostActive then return end
+    ViewBoostActive = true
+
+    pcall(function() Lighting.FogStart = 1e8 end)
+    pcall(function() Lighting.FogEnd = 1e9 end)
+
+    pcall(function() workspace.StreamingMinRadius = 512 end)
+    pcall(function() workspace.StreamingTargetRadius = 10000 end)
+
+    pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level21 end)
+end
+
+local function restoreViewDistance()
+    if not ViewBoostActive then return end
+    ViewBoostActive = false
+
+    if OriginalFogEnd then
+        pcall(function() Lighting.FogEnd = OriginalFogEnd end)
+    end
+    if OriginalFogStart then
+        pcall(function() Lighting.FogStart = OriginalFogStart end)
+    end
+    if OriginalStreamingMinRadius then
+        pcall(function() workspace.StreamingMinRadius = OriginalStreamingMinRadius end)
+    end
+    if OriginalStreamingTargetRadius then
+        pcall(function() workspace.StreamingTargetRadius = OriginalStreamingTargetRadius end)
+    end
+    pcall(function() settings().Rendering.QualityLevel = OriginalGraphics end)
+end
 
 local function isCharacterObject(obj)
     local current = obj
@@ -4491,46 +4542,23 @@ local function waitAndHide(stateChecker)
     optimizationLoading = true
 
     task.spawn(function()
+        pcall(applyMaxViewDistance)
+
         pcall(function()
-            OriginalGraphics = settings().Rendering.QualityLevel
-            settings().Rendering.QualityLevel = Enum.QualityLevel.Level10
-            
             StarterGui:SetCore("SendNotification", {
                 Title = "Fps Boost",
-                Text = "Renderizando o mapa, apagando estruturas e removendo sombras. Aguarde...",
-                Duration = 4,
+                Text = "Visão máxima ativada + apagando estruturas instantaneamente...",
+                Duration = 3,
             })
         end)
 
-        local lastCount = -1
-        local stableTime = 0
-        local startTime = os.clock()
-
-        while optimizationLoading and stateChecker() and os.clock() - startTime < 10 do
-            local count = #workspace:GetDescendants()
-            if count == lastCount then
-                stableTime = stableTime + 0.5
-                if stableTime >= 2 then
-                    break
-                end
-            else
-                lastCount = count
-                stableTime = 0
-            end
-            task.wait(0.5)
-        end
-
-        if optimizationLoading and stateChecker() then
+        if stateChecker() then
             hideStructures()
             removeAllShadows()
             if getLocateStructures and getLocateStructures() then
                 updateHighlightsLoop()
             end
         end
-
-        pcall(function()
-            settings().Rendering.QualityLevel = OriginalGraphics
-        end)
 
         optimizationLoading = false
     end)
@@ -4551,9 +4579,7 @@ setOtimizacao, getOtimizacao = createToggleCard(
             end
             restoreStructures()
             restoreAllShadows()
-            pcall(function()
-                settings().Rendering.QualityLevel = OriginalGraphics
-            end)
+            restoreViewDistance()
         end
     end
 )
@@ -4655,10 +4681,13 @@ local function destroyScript()
     optimizationLoading = false
     restoreStructures()
     restoreAllShadows()
+    restoreViewDistance()
     stopAntiAFK()
     pcall(function()
         settings().Rendering.QualityLevel = OriginalGraphics
     end)
+    if OriginalFogEnd then pcall(function() Lighting.FogEnd = OriginalFogEnd end) end
+    if OriginalFogStart then pcall(function() Lighting.FogStart = OriginalFogStart end) end
 end
 
 _G.__RamdomHubStop = destroyScript
@@ -4705,7 +4734,7 @@ tween(Main, {Size = CONFIG.UISize, Position = CONFIG.UIOffset}, 0.35, Enum.Easin
 pcall(function()
     StarterGui:SetCore("SendNotification", {
         Title = "RAMDOM HUB v" .. CONFIG.Version,
-        Text = "Slots 1-0 selecionáveis sempre, só equipam com toggle ON!",
+        Text = "Fps Boost agora vê o mapa inteiro e apaga tudo instantaneamente!",
         Duration = 5,
     })
 end)
