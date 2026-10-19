@@ -5300,27 +5300,29 @@ end
 local FISH_CFG = {
     -- Loop e varredura mais lentos; posições dos elementos cacheados atualizam automaticamente.
     -- Loop leve; o marcador já cacheado é atualizado a cada TickRate sem rescanner toda a UI.
-    TickRate = 0.08,
-    HubScanInterval = 0.75,
-    HubRescanInterval = 2.0,
+    TickRate = 0.05,
+    -- A varredura da UI fica mais frequente para notar mais cedo o fim da captura,
+    -- mas o par de elementos é reutilizado entre as varreduras para evitar custo alto.
+    HubScanInterval = 0.15,
+    HubRescanInterval = 0.55,
     CastRetryDelay = 6.0,
-    -- Aguarda a UI da captura fechar antes de preparar outro lançamento.
-    PostCatchCastDelay = 1.0,
-    PostCatchQuietTime = 2.0,
-    HubLossGraceInterval = 0.40,
-    -- Não considera o minijogo encerrado após uma única leitura vazia;
-    -- evita que um clique de novo lançamento interrompa uma pesca ainda ativa.
-    HubDisappearConfirmTime = 1.80,
+    -- Após a confirmação de captura, relança rapidamente.
+    PostCatchCastDelay = 0.05,
+    PostCatchQuietTime = 0.02,
+    HubLossGraceInterval = 0.03,
+    -- Confirma o desaparecimento com uma janela curta, evitando relançar em uma
+    -- leitura vazia isolada ou interromper a interface durante uma transição breve.
+    HubDisappearConfirmTime = 0.08,
     -- Após lançar, aguarda tempo suficiente para a mordida/hub aparecer antes
     -- de tentar outro clique na água (que poderia fechar o minijogo atual).
     HubAppearTimeout = 20.0,
     -- Um clique/toque real pode sincronizar o estado do botão com o jogo por um instante;
     -- não conclui a pesca imediatamente durante essa janela.
-    ManualInputGraceTime = 1.25,
+    ManualInputGraceTime = 0.30,
     NoHubRetryDelay = 3.0,
     NoRodRetryDelay = 1.5,
     NoWaterRetryDelay = 3.0,
-    CastSettleDelay = 0.22,
+    CastSettleDelay = 0.14,
     CenterTolerancePx = 4,
     WaterRayLength = 1200,
     -- A mecânica do minijogo usa clique mantido para elevar o marcador amarelo.
@@ -6001,10 +6003,12 @@ do
                 local inPostCatchQuiet = now < postCatchQuietUntil
                 -- A posição muda sem trocar a instância: reutiliza o par e só rescaneia ocasionalmente.
                 if not inPostCatchQuiet and cachedPair and not isPairUsable(cachedPair) then
-                    -- Não force uma varredura cara no mesmo frame em que o hub fecha.
-                    -- Mantém a transição por uma pequena janela para liberar o mouse sem recastar já.
+                    -- Detecta imediatamente que o par cacheado sumiu; o timestamp é
+                    -- preservado durante a verificação curta, sem reiniciar a espera
+                    -- a cada varredura e sem clicar de novo durante uma piscada da UI.
                     cachedPair = nil
-                    nextHubScanAt = now + FISH_CFG.HubLossGraceInterval
+                    hubMissingSince = hubMissingSince or now
+                    nextHubScanAt = math.min(nextHubScanAt, now + FISH_CFG.HubLossGraceInterval)
                 end
                 if not inPostCatchQuiet and now >= nextHubScanAt then
                     local previouslyVisible = cachedHubVisible
@@ -6028,7 +6032,7 @@ do
                         awaitingHubSince = nil
                         hubMissingSince = nil
                     elseif previouslyVisible then
-                        hubMissingSince = now
+                        hubMissingSince = hubMissingSince or now
                     end
                     if hasSeenHubSinceCast and not cachedHubVisible
                         and hubMissingSince
