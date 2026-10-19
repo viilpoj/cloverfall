@@ -5163,10 +5163,15 @@ end
 --// ==========================================
 local FISH_CFG = {
     -- Loop e varredura mais lentos; posições dos elementos cacheados atualizam automaticamente.
-    TickRate = 0.065,
-    HubScanInterval = 0.45,
+    -- Loop leve; o marcador já cacheado é atualizado a cada TickRate sem rescanner toda a UI.
+    TickRate = 0.08,
+    HubScanInterval = 0.75,
     HubRescanInterval = 2.0,
     CastRetryDelay = 6.0,
+    -- Aguarda a UI da captura fechar antes de preparar outro lançamento.
+    PostCatchCastDelay = 2.5,
+    PostCatchQuietTime = 2.0,
+    HubLossGraceInterval = 0.40,
     NoRodRetryDelay = 1.5,
     NoWaterRetryDelay = 3.0,
     CastSettleDelay = 0.22,
@@ -5191,7 +5196,9 @@ do
     local mouseBackend = nil
     local mousePosition = nil
     local lastCastAt = -math.huge
+    local postCatchQuietUntil = 0
     local statusLastWarn = ""
+    local nextGuiTrackingCheck = 0
     -- GUI objects são cacheados por eventos: evita chamar GetDescendants() repetidamente.
     local candidateGuiObjects = setmetatable({}, {__mode = "k"})
     local trackedRoots = setmetatable({}, {__mode = "k"})
@@ -5274,7 +5281,6 @@ do
     end
 
     local function isYellowMarker(obj)
-        if not isVisibleGuiObject(obj) then return false end
         local size = obj.AbsoluteSize
         if size.X < 10 or size.Y < 3 or size.X < size.Y * 1.25 then return false end
         local text = getObjectText(obj)
@@ -5283,7 +5289,6 @@ do
     end
 
     local function isBlueTarget(obj)
-        if not isVisibleGuiObject(obj) then return false end
         local size = obj.AbsoluteSize
         if size.X < 7 or size.Y < 9 or size.X > 210 or size.Y > 210 then return false end
         local text = getObjectText(obj)
@@ -5395,7 +5400,10 @@ do
     end
 
     local function ensureGuiTracking()
-        -- O HUD do jogo fica normalmente no PlayerGui; evita varrer todo o CoreGui do Roblox.
+        -- Checa novas raízes no máximo uma vez a cada 3 s; não percorre CoreGui a cada scan.
+        local now = os.clock()
+        if now < nextGuiTrackingCheck then return end
+        nextGuiTrackingCheck = now + 3.0
         local playerGui = player:FindFirstChildOfClass("PlayerGui")
         if playerGui then trackGuiRoot(playerGui) end
         -- Só acompanha ScreenGuis do CoreGui com nome diretamente relacionado à pesca.
@@ -5443,7 +5451,6 @@ do
     end
 
     local function looksLikeUncoloredTarget(obj)
-        if not isVisibleGuiObject(obj) then return false end
         if not (obj:IsA("ImageLabel") or obj:IsA("ImageButton") or obj:IsA("Frame")) then return false end
         local size = obj.AbsoluteSize
         if size.X < 8 or size.Y < 14 or size.Y > 190 or size.Y < size.X * 0.55 then return false end
@@ -5466,7 +5473,6 @@ do
     end
 
     local function looksLikeUncoloredMarker(obj, target)
-        if not isVisibleGuiObject(obj) then return false end
         if not (obj:IsA("ImageLabel") or obj:IsA("ImageButton") or obj:IsA("Frame")) then return false end
         local size = obj.AbsoluteSize
         if size.X < 12 or size.X > 320 or size.Y < 3 or size.Y > 45
@@ -5485,33 +5491,47 @@ do
 
     local function scanFishingHub()
         local objects, namedHub = collectGuiObjects()
-        local blue, possibleMarkers = {}, {}
-        local yellowSet, blueSet = {}, {}
+        local explicitMarkers, fallbackMarkers = {}, {}
+        local explicitBlue, fallbackBlue = {}, {}
+        local MAX_FALLBACK_CANDIDATES = 20
+
+        -- Passagem leve: prioriza somente cor/nome explícitos; evita calcular fallbacks para tudo.
         for _, obj in ipairs(objects) do
-            local isYellow = isYellowMarker(obj)
-            if isYellow then
-                table.insert(possibleMarkers, obj)
-                yellowSet[obj] = true
-            else
-                local size = obj.AbsoluteSize
-                if (obj:IsA("Frame") or obj:IsA("ImageLabel") or obj:IsA("ImageButton"))
-                    and size.X >= 12 and size.X <= 320 and size.Y >= 3 and size.Y <= 45
-                    and size.X >= size.Y * 1.25 then
-                    table.insert(possibleMarkers, obj)
-                end
+            local size = obj.AbsoluteSize
+            if isYellowMarker(obj) then
+                table.insert(explicitMarkers, obj)
+            elseif (obj:IsA("Frame") or obj:IsA("ImageLabel") or obj:IsA("ImageButton"))
+                and size.X >= 12 and size.X <= 320 and size.Y >= 3 and size.Y <= 45
+                and size.X >= size.Y * 1.25 and #fallbackMarkers < MAX_FALLBACK_CANDIDATES then
+                table.insert(fallbackMarkers, obj)
             end
-            local isBlue = isBlueTarget(obj)
-            if isBlue or looksLikeUncoloredTarget(obj) then
-                table.insert(blue, obj)
-                blueSet[obj] = isBlue
+
+            if isBlueTarget(obj) then
+                table.insert(explicitBlue, obj)
             end
         end
+
+        -- Só faz a análise geométrica mais cara se a cor/nome não encontrou alvo azul.
+        if #explicitBlue == 0 then
+            for _, obj in ipairs(objects) do
+                if looksLikeUncoloredTarget(obj) then
+                    table.insert(fallbackBlue, obj)
+                    if #fallbackBlue >= MAX_FALLBACK_CANDIDATES then break end
+                end
+            end
+        end
+
+        local possibleMarkers = #explicitMarkers > 0 and explicitMarkers or fallbackMarkers
+        local blue = #explicitBlue > 0 and explicitBlue or fallbackBlue
+        local explicitMarkerSet, explicitBlueSet = {}, {}
+        for _, obj in ipairs(explicitMarkers) do explicitMarkerSet[obj] = true end
+        for _, obj in ipairs(explicitBlue) do explicitBlueSet[obj] = true end
 
         local bestPair, bestScore = nil, math.huge
         for _, marker in ipairs(possibleMarkers) do
             for _, target in ipairs(blue) do
                 if marker ~= target then
-                    local markerIsYellow = yellowSet[marker] == true
+                    local markerIsYellow = explicitMarkerSet[marker] == true
                     local inferredLane = nil
                     if not markerIsYellow then
                         markerIsYellow, inferredLane = looksLikeUncoloredMarker(marker, target)
@@ -5527,9 +5547,8 @@ do
                                 and math.abs(tx - laneCenterX) <= lane.AbsoluteSize.X * 0.75
                             if withinLane and horizontalGap <= math.max(95, lane.AbsoluteSize.X * 0.85) then
                                 local score = lane.AbsoluteSize.Y + horizontalGap * 1.5
-                                if not yellowSet[marker] then score = score + 180 end
-                                -- Prefere o alvo azul/roxo explícito e marcador amarelo por cor.
-                                if not blueSet[target] then score = score + 120 end
+                                if not explicitMarkerSet[marker] then score = score + 180 end
+                                if not explicitBlueSet[target] then score = score + 120 end
                                 if score < bestScore then
                                     bestScore = score
                                     bestPair = {Marker = marker, Target = target, Lane = lane}
@@ -5541,8 +5560,6 @@ do
             end
         end
 
-        -- Um par visual amarelo/azul dentro de uma barra vertical também identifica o hub
-        -- quando o jogo não dá nomes explícitos às instâncias da interface.
         return bestPair, namedHub or bestPair ~= nil
     end
 
@@ -5595,8 +5612,9 @@ do
         params.FilterDescendantsInstances = character and {character} or {}
         params.IgnoreWater = false
 
-        local xFractions = {0.22, 0.34, 0.46, 0.58, 0.70, 0.82, 0.94}
-        local yFractions = {0.44, 0.54, 0.64, 0.74, 0.84, 0.91}
+        -- Grade menor de raycasts por lançamento para evitar picos de CPU depois da captura.
+        local xFractions = {0.22, 0.36, 0.50, 0.64, 0.78, 0.92}
+        local yFractions = {0.56, 0.69, 0.82, 0.91}
         local bestPos, bestScore = nil, math.huge
         for _, yf in ipairs(yFractions) do
             for _, xf in ipairs(xFractions) do
@@ -5755,6 +5773,7 @@ do
         AutoFishing.Token = AutoFishing.Token + 1
         local token = AutoFishing.Token
         lastCastAt = -math.huge
+        postCatchQuietUntil = 0
         statusLastWarn = ""
         ensureGuiTracking()
         AutoFishing.Status = "procurando vara, água e hub de pesca"
@@ -5764,13 +5783,15 @@ do
             local hubMissingSince = nil
             while isActive(token) do
                 local now = os.clock()
+                local inPostCatchQuiet = now < postCatchQuietUntil
                 -- A posição muda sem trocar a instância: reutiliza o par e só rescaneia ocasionalmente.
-                if cachedPair and not isPairUsable(cachedPair) then
+                if not inPostCatchQuiet and cachedPair and not isPairUsable(cachedPair) then
+                    -- Não force uma varredura cara no mesmo frame em que o hub fecha.
+                    -- Mantém a transição por uma pequena janela para liberar o mouse sem recastar já.
                     cachedPair = nil
-                    cachedHubVisible = false
-                    nextHubScanAt = 0
+                    nextHubScanAt = now + FISH_CFG.HubLossGraceInterval
                 end
-                if now >= nextHubScanAt then
+                if not inPostCatchQuiet and now >= nextHubScanAt then
                     local previouslyVisible = cachedHubVisible
                     local ok, pair, hubVisible = pcall(scanFishingHub)
                     if ok then
@@ -5791,8 +5812,10 @@ do
                         hubMissingSince = now
                     end
                     if not cachedHubVisible and hubMissingSince and now - hubMissingSince >= 0.60 then
-                        -- Só considera a pesca encerrada após a interface ficar ausente por um instante.
-                        lastCastAt = -math.huge
+                        -- Confirma que a captura terminou, mas espera antes de relançar.
+                        -- Antes, -math.huge provocava raycasts + clique imediatamente após sumir o hub.
+                        lastCastAt = now - FISH_CFG.CastRetryDelay + FISH_CFG.PostCatchCastDelay
+                        postCatchQuietUntil = now + FISH_CFG.PostCatchQuietTime
                         hubMissingSince = nil
                     end
                 end
