@@ -5305,7 +5305,7 @@ local FISH_CFG = {
     HubRescanInterval = 2.0,
     CastRetryDelay = 6.0,
     -- Aguarda a UI da captura fechar antes de preparar outro lançamento.
-    PostCatchCastDelay = 2.5,
+    PostCatchCastDelay = 1.0,
     PostCatchQuietTime = 2.0,
     HubLossGraceInterval = 0.40,
     -- Não considera o minijogo encerrado após uma única leitura vazia;
