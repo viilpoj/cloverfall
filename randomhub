@@ -1608,6 +1608,53 @@ do
         return nil
     end
 
+    -- Detecta a picareta nas ferramentas equipadas ou nos slots da mochila,
+    -- seguindo o mesmo padrão usado pelo Auto Fish para encontrar a vara.
+    local function getMiningTool()
+        local character = player.Character
+        local backpack = player:FindFirstChildOfClass("Backpack")
+
+        local function matches(tool)
+            if not tool or not tool:IsA("Tool") then return false end
+            local n = string.lower(tostring(tool.Name or ""))
+            n = n:gsub("[_%-%.]+", " "):gsub("%s+", " ")
+            return n:find("pickaxe", 1, true) ~= nil
+                or n:find("pick axe", 1, true) ~= nil
+                or n:find("pick", 1, true) ~= nil
+                or n:find("mining tool", 1, true) ~= nil
+                or n:find("drill", 1, true) ~= nil
+        end
+
+        if character then
+            for _, item in ipairs(character:GetChildren()) do
+                if matches(item) then return item, true end
+            end
+        end
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if matches(item) then return item, false end
+            end
+        end
+        return nil, false
+    end
+
+    local function ensureMiningToolEquipped()
+        local tool, equipped = getMiningTool()
+        if not tool then return false end
+        if equipped then return true end
+
+        local character = player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return false end
+
+        pcall(function() humanoid:EquipTool(tool) end)
+        task.wait(0.15)
+        local equippedTool, isEquipped = getMiningTool()
+        return equippedTool ~= nil and isEquipped
+    end
+
+    local lastPickaxeWarningAt = -math.huge
+
     local function sendKeys(down)
         if not MINER_CFG.HoldShiftWhileMoving then return end
         pcall(function()
@@ -3736,6 +3783,17 @@ do
             return
         end
 
+        if not ensureMiningToolEquipped() then
+            setMoving(false)
+            aimTarget = nil
+            if os.clock() - lastPickaxeWarningAt >= 5 then
+                lastPickaxeWarningAt = os.clock()
+                warn("[RAMDOM HUB] Auto Miner: não encontrei uma picareta/ferramenta de mineração equipada ou na mochila.")
+            end
+            task.wait(0.75)
+            return
+        end
+
         local _, _, root = getChar()
         if not root then
             setMoving(false)
@@ -3929,6 +3987,56 @@ do
         s = s:gsub("%s+", " ")
         return string.lower(s):match("^%s*(.-)%s*$") or ""
     end
+
+    -- Procura machado/hatchet entre as Tools equipadas e as Tools nos slots
+    -- do Backpack, tal como o Auto Fish procura a vara de pesca.
+    local function getWoodAxeTool()
+        local character = player.Character
+        local backpack = player:FindFirstChildOfClass("Backpack")
+
+        local function matches(tool)
+            if not tool or not tool:IsA("Tool") then return false end
+            local n = normalizeName(tool.Name)
+            if n:find("pickaxe", 1, true) or n:find("pick axe", 1, true) then
+                return false
+            end
+            return n:find("axe", 1, true) ~= nil
+                or n:find("hatchet", 1, true) ~= nil
+                or n:find("woodcutter", 1, true) ~= nil
+                or n:find("wood cutter", 1, true) ~= nil
+                or n:find("lumberjack", 1, true) ~= nil
+                or n:find("chopper", 1, true) ~= nil
+        end
+
+        if character then
+            for _, item in ipairs(character:GetChildren()) do
+                if matches(item) then return item, true end
+            end
+        end
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if matches(item) then return item, false end
+            end
+        end
+        return nil, false
+    end
+
+    local function ensureWoodAxeEquipped()
+        local tool, equipped = getWoodAxeTool()
+        if not tool then return false end
+        if equipped then return true end
+
+        local character = player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return false end
+
+        pcall(function() humanoid:EquipTool(tool) end)
+        task.wait(0.15)
+        local equippedTool, isEquipped = getWoodAxeTool()
+        return equippedTool ~= nil and isEquipped
+    end
+
+    local lastAxeWarningAt = -math.huge
 
     -- Nomes de estruturas de madeira que não são árvores. Esses filtros são
     -- aplicados antes das palavras positivas para não selecionar baús/carruagens,
@@ -5077,6 +5185,18 @@ do
             task.wait(0.3)
             return
         end
+
+        if not ensureWoodAxeEquipped() then
+            AutoWood.Target = nil
+            aimTarget = nil
+            if os.clock() - lastAxeWarningAt >= 5 then
+                lastAxeWarningAt = os.clock()
+                warn("[RAMDOM HUB] Auto Wood: não encontrei um machado/hatchet equipado ou na mochila.")
+            end
+            task.wait(0.75)
+            return
+        end
+
         local _, _, root = getChar()
         if not root then
             AutoWood.Target = nil
