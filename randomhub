@@ -1,12 +1,11 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.7                     ║
+    ║                 RAMDOM HUB  v1.8                     ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v1.7:
-      + Melhoria no Auto Wood
-      - Auto Wood Saiu do Beta
+    v1.8:
+      + Auto Fish Adicionado (Auto Itens)
 ]]
 
 --// Serviços
@@ -39,7 +38,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.7",
+    Version = "1.8",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -51,6 +50,7 @@ local ScreenGui, Main
 --// Toggles compartilhados
 local setAutoMiner, getAutoMiner
 local setAutoWood, getAutoWood
+local setAutoFishing, getAutoFishing
 local setAutoRaid, getAutoRaid
 local setLocateStructures, getLocateStructures
 
@@ -172,6 +172,24 @@ local MINER_CFG = {
     RecoveryMoveWait = 0.55,
     RecoveryJumpCooldown = 1.5,
     WaypointJumpCooldown = 1.3,
+
+    -- Recuperação de obstáculos igual à do Auto Wood, mas com 3 cliques curtos de Espaço.
+    ObstacleRecoveryEnabled = true,
+    ObstacleRayDistance = 6.0,
+    ObstacleRayWidth = 0.85,
+    ObstacleCheckInterval = 0.15,
+    ObstacleRecoveryCooldown = 1.75,
+    ObstacleRetreatDistance = 2,
+    ObstacleRetreatTimeout = 1.5,
+    ObstacleJumpCount = 3,
+    ObstacleJumpPressDuration = 0.025,
+    ObstacleJumpGap = 0.10,
+
+    -- Confirma golpes por mudança visual/vida; avança 2 studs após confirmar o primeiro.
+    HitVerifyDelay = 0.35,
+    FirstHitApproachDistance = 2,
+    MaxClicksPerOre = 3,
+    MinedNoticeGraceTime = 0.65,
 
     HoldShiftWhileMoving = MOB_CFG.HoldShiftWhileMoving,
     Debug = false,               
@@ -1751,6 +1769,142 @@ do
         end))
     end
 
+    -- Detecta notificações visuais de coleta, por exemplo:
+    -- "Mined Copper Ore x1 (Common)" ou "Collected Copper Ore".
+    -- O contador só avança quando surge/muda uma notificação visível.
+    local minerMinedNoticeCount = 0
+    local minerMinedNoticeStates = setmetatable({}, { __mode = "k" })
+    local minerMinedTextConnections = setmetatable({}, { __mode = "k" })
+    local minerMinedVisibilityConnections = setmetatable({}, { __mode = "k" })
+    local minerMinedGuiContainers = setmetatable({}, { __mode = "k" })
+
+    local function isMinerTextObject(inst)
+        return inst and (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox"))
+    end
+
+    local function isMinerGuiVisible(inst)
+        local cur = inst
+        while cur and cur ~= game do
+            if cur:IsA("GuiObject") and not cur.Visible then return false end
+            if cur:IsA("LayerCollector") and not cur.Enabled then return false end
+            cur = cur.Parent
+        end
+        return true
+    end
+
+    local function isMinedNoticeLabel(label)
+        if not isMinerTextObject(label) then return false end
+        local labelText = normalizeName(tostring(label.Text or ""))
+        local labelName = normalizeName(tostring(label.Name or ""))
+        if labelText:find("mined", 1, true)
+            or labelText:find("collected", 1, true)
+            or labelText:find("colleted", 1, true) then
+            return true
+        end
+        -- Alguns jogos mantêm o nome do TextLabel como "Mined" ou "Collected"
+        -- e só alteram o texto exibido.
+        return (labelName:find("mined", 1, true) ~= nil
+            or labelName:find("collected", 1, true) ~= nil
+            or labelName:find("colleted", 1, true) ~= nil)
+            and tostring(label.Text or "") ~= ""
+    end
+
+    local function updateMinerMinedNotice(label, eventKind)
+        if not isMinerTextObject(label) then return end
+        local currentText = tostring(label.Text or "")
+        local visible = isMinerGuiVisible(label)
+        local matches = isMinedNoticeLabel(label)
+        local state = minerMinedNoticeStates[label]
+        local now = os.clock()
+
+        if not state then
+            state = { Text = currentText, Visible = visible, LastCountAt = -math.huge }
+            minerMinedNoticeStates[label] = state
+            if eventKind == "added" and matches and visible then
+                minerMinedNoticeCount = minerMinedNoticeCount + 1
+                state.LastCountAt = now
+            end
+            return
+        end
+
+        local changed = currentText ~= state.Text or (visible and not state.Visible)
+        if eventKind == "added" and matches and visible then changed = true end
+        if matches and visible and changed and now - state.LastCountAt >= 0.25 then
+            minerMinedNoticeCount = minerMinedNoticeCount + 1
+            state.LastCountAt = now
+        end
+        state.Text = currentText
+        state.Visible = visible
+    end
+
+    local function watchMinerMinedObject(inst, eventKind)
+        if not inst then return end
+        if isMinerTextObject(inst) then
+            if not minerMinedTextConnections[inst] then
+                minerMinedTextConnections[inst] = true
+                pcall(function()
+                    inst:GetPropertyChangedSignal("Text"):Connect(function()
+                        updateMinerMinedNotice(inst, "changed")
+                    end)
+                end)
+            end
+            updateMinerMinedNotice(inst, eventKind or "initial")
+        end
+
+        if (inst:IsA("GuiObject") or inst:IsA("LayerCollector"))
+            and not minerMinedVisibilityConnections[inst] then
+            minerMinedVisibilityConnections[inst] = true
+            local prop = inst:IsA("LayerCollector") and "Enabled" or "Visible"
+            pcall(function()
+                inst:GetPropertyChangedSignal(prop):Connect(function()
+                    local ok, descendants = pcall(function() return inst:GetDescendants() end)
+                    if ok and descendants then
+                        for _, descendant in ipairs(descendants) do
+                            if isMinerTextObject(descendant) then
+                                updateMinerMinedNotice(descendant, "visibility")
+                            end
+                        end
+                    end
+                    if isMinerTextObject(inst) then updateMinerMinedNotice(inst, "visibility") end
+                end)
+            end)
+        end
+    end
+
+    local function watchMinerMinedContainer(container)
+        if not container or minerMinedGuiContainers[container] then return end
+        minerMinedGuiContainers[container] = true
+        watchMinerMinedObject(container, "initial")
+        local ok, descendants = pcall(function() return container:GetDescendants() end)
+        if ok and descendants then
+            for _, descendant in ipairs(descendants) do
+                watchMinerMinedObject(descendant, "initial")
+            end
+        end
+        pcall(function()
+            container.DescendantAdded:Connect(function(descendant)
+                watchMinerMinedObject(descendant, "added")
+                local okChildren, children = pcall(function() return descendant:GetDescendants() end)
+                if okChildren and children then
+                    for _, child in ipairs(children) do
+                        watchMinerMinedObject(child, "added")
+                    end
+                end
+            end)
+        end)
+    end
+
+    pcall(function() watchMinerMinedContainer(CoreGui) end)
+    local existingMinerPlayerGui = player:FindFirstChildOfClass("PlayerGui")
+    if existingMinerPlayerGui then
+        pcall(function() watchMinerMinedContainer(existingMinerPlayerGui) end)
+    end
+    player.ChildAdded:Connect(function(child)
+        if child:IsA("PlayerGui") then
+            pcall(function() watchMinerMinedContainer(child) end)
+        end
+    end)
+
     local function knownOreTypeFromText(text)
         local s = normalizeName(text)
         for _, entry in ipairs(KNOWN_ORE_TYPES) do
@@ -2229,6 +2383,55 @@ do
         for _, pair in ipairs(axes) do
             local oldValue, newValue = pair[1], pair[2]
             if oldValue - newValue >= math.max(0.05, oldValue * 0.025) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function isHealthLikeKey(key)
+        local compact = normalizeName(key):gsub("%s+", "")
+        return compact:find("health", 1, true) ~= nil
+            or compact == "hp" or compact:find("hitpoints", 1, true) ~= nil
+            or compact:find("durability", 1, true) ~= nil
+            or compact:find("integrity", 1, true) ~= nil
+            or compact:find("hitsremaining", 1, true) ~= nil
+            or compact:find("remaininghits", 1, true) ~= nil
+    end
+
+    local function getOreHealthSignature(inst)
+        local values = {}
+        if not inst then return values end
+        local objects = { inst }
+        local ok, descendants = pcall(function() return inst:GetDescendants() end)
+        if ok and descendants then
+            for index, descendant in ipairs(descendants) do
+                if index > 120 then break end
+                table.insert(objects, descendant)
+            end
+        end
+
+        for _, obj in ipairs(objects) do
+            local okAttrs, attrs = pcall(function() return obj:GetAttributes() end)
+            if okAttrs and type(attrs) == "table" then
+                for key, value in pairs(attrs) do
+                    if isHealthLikeKey(key) and type(value) == "number" then
+                        values[obj:GetFullName() .. "::attr::" .. normalizeName(key)] = value
+                    end
+                end
+            end
+            if (obj:IsA("IntValue") or obj:IsA("NumberValue")) and isHealthLikeKey(obj.Name) then
+                values[obj:GetFullName() .. "::value"] = obj.Value
+            end
+        end
+        return values
+    end
+
+    local function oreHealthDecreased(before, after)
+        if type(before) ~= "table" or type(after) ~= "table" then return false end
+        for key, oldValue in pairs(before) do
+            local newValue = after[key]
+            if type(newValue) == "number" and newValue < oldValue - 0.001 then
                 return true
             end
         end
@@ -2801,6 +3004,198 @@ do
         root.CFrame = CFrame.lookAt(root.Position, Vector3.new(pos.X, root.Position.Y, pos.Z))
     end
 
+    local lastMinerObstacleRecoveryAt = -math.huge
+
+    local function minerObstacleIdentity(part)
+        if not part then return nil end
+        return part:FindFirstAncestorOfClass("Model") or part
+    end
+
+    local function minerOreOrLivingAncestor(part, targetOre)
+        if not part then return false, nil end
+        if targetOre and (part == targetOre or part:IsDescendantOf(targetOre)
+            or targetOre:IsDescendantOf(part)) then
+            return true, targetOre
+        end
+
+        local cur = part
+        local oreRoot = nil
+        while cur and cur ~= workspace do
+            if cur:IsA("Model") and cur:FindFirstChildOfClass("Humanoid") then
+                return true, cur
+            end
+            local ok, kind = pcall(classify, cur)
+            if ok and kind then oreRoot = cur end
+            cur = cur.Parent
+        end
+        return oreRoot ~= nil, oreRoot
+    end
+
+    local function raycastMinerObstacle(origin, direction, targetOre)
+        local filters = {}
+        if player.Character then table.insert(filters, player.Character) end
+        if targetOre then table.insert(filters, targetOre) end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = filters
+        params.IgnoreWater = true
+        pcall(function() params.RespectCanCollide = true end)
+
+        for _ = 1, 16 do
+            local hit = workspace:Raycast(origin, direction * MINER_CFG.ObstacleRayDistance, params)
+            if not hit then return nil end
+            local part = hit.Instance
+            if part == workspace.Terrain then
+                return hit
+            elseif part and part:IsA("BasePart") then
+                local shouldIgnore, ignoreRoot = minerOreOrLivingAncestor(part, targetOre)
+                if shouldIgnore or not part.CanCollide then
+                    -- Ignora o minério-alvo, personagens e peças decorativas não sólidas,
+                    -- mas continua o raio para encontrar uma parede logo atrás deles.
+                    table.insert(filters, ignoreRoot or part)
+                    params.FilterDescendantsInstances = filters
+                else
+                    -- Não exige que a parede esteja a 1 stud de distância: obstáculos
+                    -- pequenos ou muito próximos também devem acionar a recuperação.
+                    return hit
+                end
+            else
+                return hit
+            end
+        end
+        return nil
+    end
+
+    local function getBlockingMinerObstacle(root, direction, targetOre)
+        if not (MINER_CFG.ObstacleRecoveryEnabled and root and direction) then return nil end
+        local flat = Vector3.new(direction.X, 0, direction.Z)
+        if flat.Magnitude < 0.1 then return nil end
+        flat = flat.Unit
+        local side = Vector3.new(-flat.Z, 0, flat.X)
+        local lateralOffsets = { -MINER_CFG.ObstacleRayWidth, 0, MINER_CFG.ObstacleRayWidth }
+        local heights = { 0.10, 0.25, 0.45, 0.70, 1.00, 1.40, 1.90, 2.40 }
+        local counts, centerIdentity = {}, nil
+        local _, hum = getChar()
+        local groundOffset = (hum and hum.HipHeight or 2) + (root.Size.Y * 0.5)
+        local nearGroundY = root.Position.Y - groundOffset + 0.08
+
+        for heightIndex, height in ipairs(heights) do
+            for lateralIndex, lateralOffset in ipairs(lateralOffsets) do
+                local origin = Vector3.new(root.Position.X, nearGroundY + height, root.Position.Z)
+                    + side * lateralOffset
+                local hit = raycastMinerObstacle(origin, flat, targetOre)
+                if hit then
+                    local identity = minerObstacleIdentity(hit.Instance)
+                    if identity then
+                        counts[identity] = (counts[identity] or 0) + 1
+                        -- Qualquer acerto no raio central, inclusive junto ao chão,
+                        -- basta para reagir a uma barreira estreita/baixa.
+                        if lateralIndex == 2 then
+                            centerIdentity = identity
+                        end
+                    end
+                end
+            end
+        end
+
+        local best, bestCount = nil, 0
+        for identity, count in pairs(counts) do
+            if count > bestCount then best, bestCount = identity, count end
+        end
+        if best and bestCount >= 2 then return best end
+        return centerIdentity
+    end
+
+    local function minerForwardFlat(root, direction)
+        local flat = direction and Vector3.new(direction.X, 0, direction.Z)
+        if not flat or flat.Magnitude < 0.05 then
+            local look = root and root.CFrame.LookVector or Vector3.new(0, 0, -1)
+            flat = Vector3.new(look.X, 0, look.Z)
+        end
+        if flat.Magnitude < 0.05 then return Vector3.new(0, 0, -1) end
+        return flat.Unit
+    end
+
+    local function releaseMinerSpace()
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+        end)
+    end
+
+    local function retreatMinerTwoStuds(hum, root, token, forwardDirection)
+        if not (isActive(token) and hum and root and hum.Parent and root.Parent) then
+            return false
+        end
+        local startPos = root.Position
+        local backward = -minerForwardFlat(root, forwardDirection)
+        local destination = startPos + backward * MINER_CFG.ObstacleRetreatDistance
+        local moveTarget = destination + backward * 0.95
+        local reached = false
+        local connection = hum.MoveToFinished:Connect(function(success)
+            if success then reached = true end
+        end)
+        pcall(function() hum:MoveTo(moveTarget) end)
+        local deadline = os.clock() + MINER_CFG.ObstacleRetreatTimeout
+        while isActive(token) and hum.Parent and root.Parent do
+            local delta = root.Position - destination
+            if Vector3.new(delta.X, 0, delta.Z).Magnitude <= 0.25 or reached
+                or os.clock() >= deadline then
+                break
+            end
+            task.wait(0.025)
+        end
+        pcall(function() hum:MoveTo(root.Position) end)
+        if connection then connection:Disconnect() end
+        return isActive(token)
+    end
+
+    local function performMinerObstacleRecovery(hum, root, forwardDirection, token, force)
+        if not isActive(token)
+            or (not force and os.clock() - lastMinerObstacleRecoveryAt < MINER_CFG.ObstacleRecoveryCooldown) then
+            return false
+        end
+        if force then
+            dbg("personagem preso; recuando 2 studs e iniciando 3 cliques de pulo")
+        else
+            dbg("obstáculo à frente; iniciando recuperação")
+        end
+        setMoving(false)
+        pcall(function() hum:MoveTo(root.Position) end)
+        releaseMinerSpace()
+
+        if not retreatMinerTwoStuds(hum, root, token, forwardDirection) then
+            lastMinerObstacleRecoveryAt = os.clock()
+            releaseMinerSpace()
+            setMoving(false)
+            return false
+        end
+
+        for index = 1, MINER_CFG.ObstacleJumpCount do
+            if not isActive(token) then
+                releaseMinerSpace()
+                setMoving(false)
+                return false
+            end
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+            end)
+            task.wait(MINER_CFG.ObstacleJumpPressDuration)
+            releaseMinerSpace()
+            if index < MINER_CFG.ObstacleJumpCount then
+                task.wait(MINER_CFG.ObstacleJumpGap)
+            end
+        end
+        releaseMinerSpace()
+
+        if isActive(token) then
+            -- Volta ao movimento normal do Auto Miner; não simula W+Shift extra.
+            setMoving(true)
+        end
+        lastMinerObstacleRecoveryAt = os.clock()
+        return isActive(token)
+    end
+
     local function walkTo(info, token)
         local waypoints = info.Waypoints
         local idx = 1
@@ -2819,21 +3214,13 @@ do
         local plannedCenter = info.Center
         local lastMoveTarget, lastMoveAt = nil, 0
         local lastWaypointJumpAt = 0
-        local lastRecoveryJumpAt = -math.huge
+        local nextObstacleCheck = t0
         local result = "parou"
 
         local function releaseSpace()
             pcall(function()
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
             end)
-        end
-
-        local function tapSpace()
-            pcall(function()
-                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-            end)
-            task.wait(0.08)
-            releaseSpace()
         end
 
         local function attemptRecovery(hum, root)
@@ -2845,14 +3232,14 @@ do
             dbg("personagem preso; recuperação", recoveryAttempts, "de", MINER_CFG.MaxRecoveryAttempts)
             setMoving(false)
             pcall(function() hum:MoveTo(root.Position) end)
-            task.wait(0.12)
+            task.wait(0.10)
             if not isActive(token) then
                 releaseSpace()
                 return false
             end
 
-            local stand = info.StandPoint or info.GroundPos or info.Center
-            local toward = Vector3.new(stand.X - root.Position.X, 0, stand.Z - root.Position.Z)
+            local destination = info.StandPoint or info.GroundPos or info.Center
+            local toward = Vector3.new(destination.X - root.Position.X, 0, destination.Z - root.Position.Z)
             if toward.Magnitude < 0.1 then
                 local look = root.CFrame.LookVector
                 toward = Vector3.new(look.X, 0, look.Z)
@@ -2862,52 +3249,23 @@ do
             else
                 toward = toward.Unit
             end
-            local side = Vector3.new(-toward.Z, 0, toward.X)
-            local directionIndex = ((recoveryAttempts - 1) % 3) + 1
-            local nudgeDirection
-            if directionIndex == 1 then
-                nudgeDirection = side
-            elseif directionIndex == 2 then
-                nudgeDirection = -side
-            else
-                nudgeDirection = -toward
-            end
 
-            local beforeNudge = root.Position
-            local nudgeTarget = beforeNudge + nudgeDirection * MINER_CFG.RecoveryMoveDistance
-            setMoving(true)
-            pcall(function() hum:MoveTo(nudgeTarget) end)
-            task.wait(MINER_CFG.RecoveryMoveWait)
-            if not isActive(token) then
+            -- O detector de travamento chama a recuperação forçada: ela não depende
+            -- de outro Raycast e não é bloqueada pelo cooldown de obstáculo.
+            local recovered = performMinerObstacleRecovery(hum, root, toward, token, true)
+            releaseSpace()
+            if not recovered or not isActive(token) then
                 setMoving(false)
-                releaseSpace()
                 return false
             end
 
-            local _, humAfterNudge, rootAfterNudge = getChar()
-            local nudged = rootAfterNudge
-                and horizontal(rootAfterNudge.Position, beforeNudge) >= MINER_CFG.StuckPositionThreshold
-
-            if not nudged and os.clock() - lastRecoveryJumpAt >= MINER_CFG.RecoveryJumpCooldown then
-                lastRecoveryJumpAt = os.clock()
-                tapSpace()
-                local _, jumpHum, jumpRoot = getChar()
-                if jumpHum and jumpRoot then
-                    pcall(function() jumpHum.Jump = true end)
-                    local jumpDestination = info.StandPoint or info.Center
-                    pcall(function() jumpHum:MoveTo(jumpDestination) end)
-                end
-                task.wait(0.35)
-            end
-
-            releaseSpace()
             local _, currentHum, currentRoot = getChar()
             if not (currentHum and currentRoot) then
                 setMoving(false)
                 return false
             end
 
-            local destination = info.StandPoint or info.Center
+            destination = info.StandPoint or info.GroundPos or info.Center
             local okPath, newWps = computePath(currentRoot.Position, destination)
             if okPath and newWps and #newWps > 0 then
                 local endpoint = newWps[#newWps].Position
@@ -2925,7 +3283,7 @@ do
             end
 
             if not okPath then
-                dbg("rota alternativa não encontrada após recuperação", recoveryAttempts)
+                dbg("rota alternativa não encontrada após recuo e pulos", recoveryAttempts)
                 waypoints = nil
                 idx = 1
                 plannedCenter = info.Center
@@ -2948,7 +3306,7 @@ do
             lastCheck = os.clock()
             stuck = 0
             setMoving(true)
-            dbg("rota recalculada após recuperação", recoveryAttempts)
+            dbg("rota recalculada após recuo e pulos", recoveryAttempts)
             return true
         end
 
@@ -3058,45 +3416,90 @@ do
                     end
                 end
 
-                local targetChanged = not lastMoveTarget
-                    or (target - lastMoveTarget).Magnitude > 1.25
-                if targetChanged or (now - lastMoveAt) >= MINER_CFG.MoveToRefreshInterval then
-                    hum:MoveTo(target)
-                    lastMoveTarget = target
-                    lastMoveAt = now
-                    if targetChanged then
-                        lastTargetDistance = nil
-                        lastPos = root.Position
-                        lastCheck = now
-                        stuck = 0
-                    end
-                end
-
-                if now - lastCheck >= MINER_CFG.StuckCheckInterval then
-                    local movement = lastPos and (root.Position - lastPos).Magnitude or math.huge
-                    local targetDistance = (root.Position - target).Magnitude
-                    local movedTowardTarget = lastTargetDistance == nil
-                        or targetDistance < lastTargetDistance - 0.2
-                    local madeProgress = movement >= MINER_CFG.StuckPositionThreshold and movedTowardTarget
-                    if madeProgress then
-                        stuck = 0
-                    else
-                        stuck = stuck + (now - lastCheck)
-                    end
-                    lastPos = root.Position
-                    lastTargetDistance = targetDistance
-                    lastCheck = now
-                end
-
-                if stuck >= MINER_CFG.StuckTimeout then
-                    stuck = 0
-                    local recovered = attemptRecovery(hum, root)
-                    if not recovered then
-                        if recoveryAttempts >= MINER_CFG.MaxRecoveryAttempts then
-                            result = "inalcancavel"
-                            break
+                local recoveredObstacle = false
+                if MINER_CFG.ObstacleRecoveryEnabled and now >= nextObstacleCheck
+                    and horizontal(root.Position, target) > MINER_CFG.WalkStopDistance then
+                    local pathDirection = target - root.Position
+                    local obstacle = getBlockingMinerObstacle(root, pathDirection, info.Inst)
+                    if obstacle and os.clock() - lastMinerObstacleRecoveryAt >= MINER_CFG.ObstacleRecoveryCooldown then
+                        local recovered = performMinerObstacleRecovery(hum, root, pathDirection, token)
+                        if recovered and isActive(token) then
+                            local _, resumedHum, resumedRoot = getChar()
+                            if resumedHum and resumedRoot then
+                                local destination = info.StandPoint or info.GroundPos or info.Center
+                                local pathOk, newWaypoints = computePath(resumedRoot.Position, destination)
+                                if pathOk and newWaypoints and #newWaypoints > 0 then
+                                    local endpoint = newWaypoints[#newWaypoints].Position
+                                    if horizontal(endpoint, destination) <= 8
+                                        and math.abs(endpoint.Y - destination.Y) <= 8 then
+                                        waypoints = newWaypoints
+                                    else
+                                        pathOk = false
+                                    end
+                                end
+                                if not pathOk then
+                                    if checkReachable(info, resumedRoot, true) then
+                                        waypoints = info.Waypoints
+                                    else
+                                        waypoints = nil
+                                    end
+                                end
+                                idx = 1
+                                plannedCenter = info.Center
+                                lastMoveTarget, lastMoveAt = nil, 0
+                                lastTargetDistance = nil
+                                lastPos = resumedRoot.Position
+                                lastCheck = os.clock()
+                                stuck = 0
+                                recoveredObstacle = true
+                                dbg("rota retomada após recuperação de obstáculo")
+                            end
                         end
-                        task.wait(0.15)
+                    end
+                    nextObstacleCheck = os.clock() + MINER_CFG.ObstacleCheckInterval
+                end
+
+                if not recoveredObstacle then
+                    local targetChanged = not lastMoveTarget
+                        or (target - lastMoveTarget).Magnitude > 1.25
+                    if targetChanged or (now - lastMoveAt) >= MINER_CFG.MoveToRefreshInterval then
+                        hum:MoveTo(target)
+                        lastMoveTarget = target
+                        lastMoveAt = now
+                        if targetChanged then
+                            lastTargetDistance = nil
+                            lastPos = root.Position
+                            lastCheck = now
+                            stuck = 0
+                        end
+                    end
+
+                    if now - lastCheck >= MINER_CFG.StuckCheckInterval then
+                        local movement = lastPos and (root.Position - lastPos).Magnitude or math.huge
+                        local targetDistance = (root.Position - target).Magnitude
+                        local movedTowardTarget = lastTargetDistance == nil
+                            or targetDistance < lastTargetDistance - 0.2
+                        local madeProgress = movement >= MINER_CFG.StuckPositionThreshold and movedTowardTarget
+                        if madeProgress then
+                            stuck = 0
+                        else
+                            stuck = stuck + (now - lastCheck)
+                        end
+                        lastPos = root.Position
+                        lastTargetDistance = targetDistance
+                        lastCheck = now
+                    end
+
+                    if stuck >= MINER_CFG.StuckTimeout then
+                        stuck = 0
+                        local recovered = attemptRecovery(hum, root)
+                        if not recovered then
+                            if recoveryAttempts >= MINER_CFG.MaxRecoveryAttempts then
+                                result = "inalcancavel"
+                                break
+                            end
+                            task.wait(0.15)
+                        end
                     end
                 end
 
@@ -3108,22 +3511,74 @@ do
         return result
     end
 
+    local function moveForwardTwoStudsAfterHit(info, token)
+        local _, hum, root = getChar()
+        if not (isActive(token) and hum and root and info and info.Center) then return false end
+        local toward = Vector3.new(info.Center.X - root.Position.X, 0, info.Center.Z - root.Position.Z)
+        if toward.Magnitude < 0.1 then return false end
+        toward = toward.Unit
+
+        local startPos = root.Position
+        local destination = startPos + toward * MINER_CFG.FirstHitApproachDistance
+        -- MoveTo para ligeiramente antes do destino; acrescentamos 0,95 stud para
+        -- aproximar a distância final real de 2 studs.
+        local moveTarget = destination + toward * 0.95
+        pcall(function() hum:MoveTo(moveTarget) end)
+        local deadline = os.clock() + 0.9
+        while isActive(token) and root.Parent do
+            local delta = root.Position - destination
+            if Vector3.new(delta.X, 0, delta.Z).Magnitude <= 0.25
+                or os.clock() >= deadline then
+                break
+            end
+            task.wait(0.025)
+        end
+        pcall(function() hum:MoveTo(root.Position) end)
+        return isActive(token)
+    end
+
     local function mineLoop(info, token)
         setMoving(false)
 
         local reach = (info.Radius or 1) + MINER_CFG.MineDistance
         local t0 = os.clock()
         local invBefore = snapshotInventory()
+        local minedNoticeBefore = minerMinedNoticeCount
         local lastInvCheck = 0
         local result, why = "parou", nil
         local clickAttempts = 0
-        local firstClickPending = false
-        local firstClickDeadline = nil
-        local firstClickAt = nil
-        local firstClickSignature = nil
+        local pendingHit = nil
+        local firstHitApproachDone = false
+        local function advanceAfterFirstClickIfCollected()
+            if clickAttempts == 1 and not firstHitApproachDone and info.Center then
+                firstHitApproachDone = true
+                moveForwardTwoStudsAfterHit(info, token)
+            end
+        end
         info.MiningStarted = true
         info.ClickAttempts = 0
         info.HiddenSince = nil
+
+        local function confirmCollectionDuringGrace()
+            local graceDeadline = os.clock() + MINER_CFG.MinedNoticeGraceTime
+            local nextInventoryCheck = 0
+            while isActive(token) and os.clock() < graceDeadline do
+                if minerMinedNoticeCount > minedNoticeBefore then
+                    return true, "notificação Mined/Collected"
+                end
+                local gone, goneWhy = oreGone(info)
+                if gone then return true, goneWhy or "minério removido" end
+                local now = os.clock()
+                if now >= nextInventoryCheck then
+                    nextInventoryCheck = now + 0.12
+                    if inventoryIncreased(invBefore, snapshotInventory(), info) then
+                        return true, "item adicionado ao inventário"
+                    end
+                end
+                task.wait(0.05)
+            end
+            return false, nil
+        end
 
         while isActive(token) do
             local _, hum, root = getChar()
@@ -3134,7 +3589,14 @@ do
 
             local gone, goneWhy = oreGone(info)
             if gone then
+                advanceAfterFirstClickIfCollected()
                 result, why = "coletado", goneWhy
+                break
+            end
+
+            if minerMinedNoticeCount > minedNoticeBefore then
+                advanceAfterFirstClickIfCollected()
+                result, why = "coletado", "notificação Mined/Collected"
                 break
             end
 
@@ -3149,22 +3611,51 @@ do
             if now - lastInvCheck >= 0.15 then
                 lastInvCheck = now
                 if inventoryIncreased(invBefore, snapshotInventory(), info) then
+                    advanceAfterFirstClickIfCollected()
                     result, why = "coletado", "item no inventário"
                     break
                 end
             end
 
-            if firstClickPending and now >= firstClickDeadline then
-                local afterSignature = getVisualSignature(info.Inst)
-                if visualSizeDecreased(firstClickSignature, afterSignature) then
-                    firstClickPending = false
-                elseif clickAttempts >= MINER_CFG.NoProgressMinClicks
-                    and firstClickAt and now - firstClickAt >= MINER_CFG.NoProgressGraceTime then
-                    result = "sem-progresso-mineracao"
-                    why = "sem alteração visual após várias tentativas"
-                    break
+            if pendingHit and now >= pendingHit.Deadline then
+                local afterVisual = getVisualSignature(info.Inst)
+                local afterHealth = getOreHealthSignature(info.Inst)
+                local hitConfirmed = visualSizeDecreased(pendingHit.Visual, afterVisual)
+                    or oreHealthDecreased(pendingHit.Health, afterHealth)
+
+                if hitConfirmed then
+                    dbg("golpe confirmado", pendingHit.ClickIndex, "em", info.Name)
+                    if pendingHit.ClickIndex == 1 and not firstHitApproachDone then
+                        firstHitApproachDone = true
+                        -- Avança 2 studs quando o primeiro golpe foi confirmado, mesmo
+                        -- que esse golpe já tenha feito o minério desaparecer.
+                        moveForwardTwoStudsAfterHit(info, token)
+                        if not isActive(token) then break end
+                        local nowGone, nowGoneWhy = oreGone(info)
+                        if nowGone then
+                            result, why = "coletado", nowGoneWhy or "minério removido no primeiro golpe"
+                            break
+                        end
+                        if minerMinedNoticeCount > minedNoticeBefore then
+                            result, why = "coletado", "notificação Mined/Collected"
+                            break
+                        end
+                    end
                 else
-                    firstClickDeadline = now + MINER_CFG.FirstClickVerifyDelay
+                    dbg("golpe sem confirmação visual/vida", pendingHit.ClickIndex, "em", info.Name)
+                end
+                pendingHit = nil
+
+                -- Após a terceira picaretada, só mantém o ore se o jogo confirmar a coleta.
+                if clickAttempts >= MINER_CFG.MaxClicksPerOre then
+                    local confirmed, confirmationWhy = confirmCollectionDuringGrace()
+                    if confirmed then
+                        result, why = "coletado", confirmationWhy
+                    else
+                        result = "sem-progresso-mineracao"
+                        why = "sem confirmação Mined/Collected após 3 picaretadas"
+                    end
+                    break
                 end
             end
 
@@ -3187,26 +3678,25 @@ do
 
             if CombatCfg.SkillBusy then
                 task.wait(0.03)
-            else
-                local signatureBefore = nil
-                if clickAttempts == 0 then
-                    signatureBefore = getVisualSignature(info.Inst)
-                end
-
+            elseif not pendingHit and clickAttempts < MINER_CFG.MaxClicksPerOre then
+                local visualBefore = getVisualSignature(info.Inst)
+                local healthBefore = getOreHealthSignature(info.Inst)
                 local clickOk, clickSent = pcall(function()
                     return clickOnce(true)
                 end)
                 if clickOk and clickSent then
                     clickAttempts = clickAttempts + 1
                     info.ClickAttempts = clickAttempts
-                    if clickAttempts == 1 then
-                        firstClickSignature = signatureBefore
-                        firstClickPending = true
-                        firstClickAt = os.clock()
-                        firstClickDeadline = firstClickAt + MINER_CFG.FirstClickVerifyDelay
-                    end
+                    pendingHit = {
+                        ClickIndex = clickAttempts,
+                        Visual = visualBefore,
+                        Health = healthBefore,
+                        Deadline = os.clock() + MINER_CFG.HitVerifyDelay,
+                    }
                 end
                 task.wait(MINER_CFG.ClickDelay)
+            else
+                task.wait(0.03)
             end
         end
 
@@ -3308,6 +3798,8 @@ do
         blocked = {}
         candidateCache = nil
         candidateCacheAt = 0
+        lastMinerObstacleRecoveryAt = -math.huge
+        releaseMinerSpace()
         for k in pairs(rejected) do
             rejected[k] = nil
         end
@@ -3345,9 +3837,7 @@ do
         AutoMiner.Target = nil
         aimTarget = nil
         setMoving(false)
-        pcall(function()
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-        end)
+        releaseMinerSpace()
         releaseMouse()
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
 
@@ -4667,6 +5157,736 @@ do
     AutoWood.Stop = stopAutoWood
 end
 
+--// ==========================================
+--// AUTO FISH — LANÇAMENTO + CONTROLE DO MINIJOGO
+--// Cache de candidatos para reduzir varreduras; controle por mouse segurado.
+--// ==========================================
+local FISH_CFG = {
+    -- Loop e varredura mais lentos; posições dos elementos cacheados atualizam automaticamente.
+    TickRate = 0.065,
+    HubScanInterval = 0.45,
+    HubRescanInterval = 2.0,
+    CastRetryDelay = 6.0,
+    NoRodRetryDelay = 1.5,
+    NoWaterRetryDelay = 3.0,
+    CastSettleDelay = 0.22,
+    CenterTolerancePx = 4,
+    WaterRayLength = 1200,
+    -- A mecânica do minijogo usa clique mantido para elevar o marcador amarelo.
+    YellowMarkerNameHints = {"yellow", "cursor", "indicator", "needle", "marker", "playerbar", "player_bar"},
+    BlueTargetNameHints = {"blue", "fish", "target", "zone", "safe", "fishbar", "fish_bar"},
+}
+
+local AutoFishing = {
+    Enabled = false,
+    Token = 0,
+    Thread = nil,
+    Status = "desligado",
+    Start = nil,
+    Stop = nil,
+}
+
+do
+    local mouseHeld = false
+    local mouseBackend = nil
+    local mousePosition = nil
+    local lastCastAt = -math.huge
+    local statusLastWarn = ""
+    -- GUI objects são cacheados por eventos: evita chamar GetDescendants() repetidamente.
+    local candidateGuiObjects = setmetatable({}, {__mode = "k"})
+    local trackedRoots = setmetatable({}, {__mode = "k"})
+    local trackingConnections = {}
+
+    local function isActive(token)
+        return AutoFishing.Enabled and AutoFishing.Token == token
+    end
+
+    local function containsAny(value, hints)
+        value = string.lower(tostring(value or ""))
+        for _, hint in ipairs(hints) do
+            if value:find(hint, 1, true) then return true end
+        end
+        return false
+    end
+
+    local function isOurGui(inst)
+        if not inst then return false end
+        if ScreenGui then
+            local ok, result = pcall(function()
+                return inst == ScreenGui or inst:IsDescendantOf(ScreenGui)
+            end)
+            if ok and result then return true end
+        end
+        local current = inst
+        while current and current ~= game do
+            if current.Name == "FlyUI" or current.Name == "FlyToggle" then return true end
+            current = current.Parent
+        end
+        return false
+    end
+
+    local function isVisibleGuiObject(obj)
+        if not obj or not obj:IsA("GuiObject") or isOurGui(obj) then return false end
+        local current = obj
+        while current and current ~= game do
+            if current:IsA("GuiObject") and not current.Visible then return false end
+            if current:IsA("ScreenGui") and not current.Enabled then return false end
+            current = current.Parent
+        end
+        return true
+    end
+
+    local function getObjectText(obj)
+        local chunks = {tostring(obj.Name or "")}
+        pcall(function()
+            if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+                table.insert(chunks, obj.Text)
+            end
+        end)
+        return string.lower(table.concat(chunks, " "))
+    end
+
+    local function colorIsYellow(c)
+        return c and c.R >= 0.62 and c.G >= 0.38 and c.B <= 0.42
+            and c.R >= c.B * 1.45
+    end
+
+    local function colorIsBlueOrPurple(c)
+        if not c then return false end
+        local blue = c.B >= 0.26 and c.B >= c.R * 1.12 and c.B >= c.G * 1.07
+        local purple = c.R >= 0.22 and c.B >= 0.25 and c.B >= c.G * 1.20 and c.R >= c.G * 1.18
+        return blue or purple
+    end
+
+    local function getGuiColor(obj)
+        local bg, img
+        pcall(function()
+            if obj.BackgroundTransparency < 0.85 then bg = obj.BackgroundColor3 end
+        end)
+        pcall(function()
+            if (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) and obj.ImageTransparency < 0.8 then
+                img = obj.ImageColor3
+            end
+        end)
+        if bg and (colorIsYellow(bg) or colorIsBlueOrPurple(bg)) then return bg end
+        if img and (colorIsYellow(img) or colorIsBlueOrPurple(img)) then return img end
+        return bg or img
+    end
+
+    local function isYellowMarker(obj)
+        if not isVisibleGuiObject(obj) then return false end
+        local size = obj.AbsoluteSize
+        if size.X < 10 or size.Y < 3 or size.X < size.Y * 1.25 then return false end
+        local text = getObjectText(obj)
+        local c = getGuiColor(obj)
+        return colorIsYellow(c) or containsAny(text, FISH_CFG.YellowMarkerNameHints)
+    end
+
+    local function isBlueTarget(obj)
+        if not isVisibleGuiObject(obj) then return false end
+        local size = obj.AbsoluteSize
+        if size.X < 7 or size.Y < 9 or size.X > 210 or size.Y > 210 then return false end
+        local text = getObjectText(obj)
+        local c = getGuiColor(obj)
+        local shapeFits = size.Y >= size.X * 0.58 or containsAny(text, FISH_CFG.BlueTargetNameHints)
+        return shapeFits and (colorIsBlueOrPurple(c) or containsAny(text, FISH_CFG.BlueTargetNameHints))
+    end
+
+    -- Mantém somente elementos com formato, cor ou nomes plausíveis para o minijogo.
+    -- Isso evita reavaliar centenas/milhares de elementos de UI em cada varredura.
+    local function isPotentialFishingGui(obj)
+        if not obj or not obj:IsA("GuiObject") or isOurGui(obj) then return false end
+        local size = obj.AbsoluteSize
+        local text = getObjectText(obj)
+        if containsAny(text, {
+            "yellow", "marker", "needle", "cursor", "indicator", "playerbar", "player_bar",
+            "blue", "fish", "target", "zone", "safe", "fishbar", "fish_bar",
+            "fishing", "minigame", "reel"
+        }) then
+            return true
+        end
+
+        local c = getGuiColor(obj)
+        local yellow = colorIsYellow(c)
+        local blue = colorIsBlueOrPurple(c)
+        local horizontalMarker = size.X >= 10 and size.X <= 320
+            and size.Y >= 3 and size.Y <= 55 and size.X >= size.Y * 1.25
+        local verticalTarget = size.X >= 8 and size.X <= 190
+            and size.Y >= 14 and size.Y <= 190 and size.Y >= size.X * 0.55
+        if yellow and horizontalMarker then return true end
+        if blue and verticalTarget then return true end
+        -- Inclui barras horizontais sem cor exposta; o pareamento exige que estejam no trilho do alvo.
+        if horizontalMarker and (obj:IsA("Frame") or obj:IsA("ImageLabel") or obj:IsA("ImageButton")) then
+            return true
+        end
+
+        -- Alguns minijogos usam ImageLabel/Frame com tintura branca ou transparente.
+        if verticalTarget and (obj:IsA("ImageLabel") or obj:IsA("ImageButton")) then
+            local hasImage = false
+            pcall(function() hasImage = obj.Image ~= "" end)
+            if hasImage then return true end
+        end
+        if verticalTarget and obj:IsA("Frame") then
+            local visibleBackground = false
+            pcall(function() visibleBackground = obj.BackgroundTransparency < 0.85 end)
+            if visibleBackground then return true end
+        end
+        return false
+    end
+
+    local function registerGuiObject(obj)
+        if not obj or not obj:IsA("GuiObject") then return end
+        if isPotentialFishingGui(obj) then
+            candidateGuiObjects[obj] = true
+        else
+            -- Só agenda uma rechecagem se o layout ainda não calculou o tamanho.
+            local size = obj.AbsoluteSize
+            if size.X <= 0 or size.Y <= 0 then
+                task.defer(function()
+                    if obj.Parent and isPotentialFishingGui(obj) then
+                        candidateGuiObjects[obj] = true
+                    end
+                end)
+            end
+        end
+    end
+
+    local function getLaneAncestor(marker, target)
+        local current = marker.Parent
+        while current and current ~= game do
+            if current:IsA("GuiObject") and target:IsDescendantOf(current) then
+                local size = current.AbsoluteSize
+                if size.Y >= 140 and size.Y >= size.X * 1.35
+                    and size.X >= 20 and size.X <= 300 then
+                    return current
+                end
+            end
+            if current:IsA("ScreenGui") then break end
+            current = current.Parent
+        end
+        return nil
+    end
+
+    local function trackGuiRoot(root)
+        if not root or trackedRoots[root] then return end
+        trackedRoots[root] = true
+        -- Conecta antes da leitura inicial para não perder elementos criados durante a ativação.
+        pcall(function()
+            table.insert(trackingConnections, root.DescendantAdded:Connect(function(obj)
+                if obj:IsA("GuiObject") then registerGuiObject(obj) end
+            end))
+            table.insert(trackingConnections, root.DescendantRemoving:Connect(function(obj)
+                if obj:IsA("GuiObject") then
+                    candidateGuiObjects[obj] = nil
+                end
+            end))
+            -- Indexa em lotes num thread separado para não congelar a ativação do toggle.
+            task.spawn(function()
+                local ok, descendants = pcall(function() return root:GetDescendants() end)
+                if not ok or not descendants then return end
+                for index, obj in ipairs(descendants) do
+                    if obj and obj.Parent and obj:IsA("GuiObject") then
+                        registerGuiObject(obj)
+                    end
+                    if index % 180 == 0 then task.wait() end
+                end
+            end)
+        end)
+    end
+
+    local function ensureGuiTracking()
+        -- O HUD do jogo fica normalmente no PlayerGui; evita varrer todo o CoreGui do Roblox.
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if playerGui then trackGuiRoot(playerGui) end
+        -- Só acompanha ScreenGuis do CoreGui com nome diretamente relacionado à pesca.
+        pcall(function()
+            for _, child in ipairs(CoreGui:GetChildren()) do
+                if child:IsA("ScreenGui") and not isOurGui(child)
+                    and containsAny(child.Name, {"fish", "fishing", "reel"}) then
+                    trackGuiRoot(child)
+                end
+            end
+        end)
+    end
+
+    local function collectGuiObjects()
+        ensureGuiTracking()
+        local objects = {}
+        local namedHub = false
+        local screenHints = {"fishing", "fishminigame", "fishingminigame", "reelgame", "fishinghud"}
+        local textHints = {"fishing minigame", "fishingminigame", "cast your line", "reel in", "keep reeling", "fish caught"}
+        -- ScreenGui costuma ser filho direto do CoreGui/PlayerGui; não varre a árvore toda aqui.
+        local roots = {CoreGui}
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if playerGui then table.insert(roots, playerGui) end
+        for _, root in ipairs(roots) do
+            pcall(function()
+                for _, inst in ipairs(root:GetChildren()) do
+                    if inst:IsA("ScreenGui") and inst.Enabled and not isOurGui(inst)
+                        and containsAny(inst.Name, screenHints) then
+                        namedHub = true
+                    end
+                end
+            end)
+        end
+        for obj in pairs(candidateGuiObjects) do
+            if obj and obj.Parent and obj:IsA("GuiObject") and isVisibleGuiObject(obj) then
+                table.insert(objects, obj)
+                if not namedHub and containsAny(getObjectText(obj), textHints) then
+                    namedHub = true
+                end
+            elseif not (obj and obj.Parent) then
+                candidateGuiObjects[obj] = nil
+            end
+        end
+        return objects, namedHub
+    end
+
+    local function looksLikeUncoloredTarget(obj)
+        if not isVisibleGuiObject(obj) then return false end
+        if not (obj:IsA("ImageLabel") or obj:IsA("ImageButton") or obj:IsA("Frame")) then return false end
+        local size = obj.AbsoluteSize
+        if size.X < 8 or size.Y < 14 or size.Y > 190 or size.Y < size.X * 0.55 then return false end
+        local text = getObjectText(obj)
+        if containsAny(text, {"tick", "arrow", "border", "background", "outline", "progress", "rail", "needle", "marker", "line", "textlabel", "namelabel", "healthlabel"}) then
+            return false
+        end
+        local c = getGuiColor(obj)
+        if colorIsYellow(c) then return false end
+        if containsAny(text, FISH_CFG.BlueTargetNameHints) then return true end
+        if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+            local hasImage = false
+            pcall(function() hasImage = obj.Image ~= "" end)
+            if hasImage then return true end
+        end
+        -- Fallback for a colored Frame whose asset color is not exposed by ImageColor3.
+        local backgroundVisible = false
+        pcall(function() backgroundVisible = obj.BackgroundTransparency < 0.85 end)
+        return backgroundVisible
+    end
+
+    local function looksLikeUncoloredMarker(obj, target)
+        if not isVisibleGuiObject(obj) then return false end
+        if not (obj:IsA("ImageLabel") or obj:IsA("ImageButton") or obj:IsA("Frame")) then return false end
+        local size = obj.AbsoluteSize
+        if size.X < 12 or size.X > 320 or size.Y < 3 or size.Y > 45
+            or size.X < size.Y * 1.25 then return false end
+        local text = getObjectText(obj)
+        if containsAny(text, {"background", "outline", "border", "rail", "track", "container", "textlabel", "namelabel", "tick", "arrow", "progress", "fill"}) then
+            return false
+        end
+        local c = getGuiColor(obj)
+        if colorIsBlueOrPurple(c) and not colorIsYellow(c) then return false end
+        local lane = getLaneAncestor(obj, target)
+        if not lane then return false end
+        if size.X < lane.AbsoluteSize.X * 0.40 or size.X > lane.AbsoluteSize.X * 1.25 then return false end
+        return true, lane
+    end
+
+    local function scanFishingHub()
+        local objects, namedHub = collectGuiObjects()
+        local blue, possibleMarkers = {}, {}
+        local yellowSet, blueSet = {}, {}
+        for _, obj in ipairs(objects) do
+            local isYellow = isYellowMarker(obj)
+            if isYellow then
+                table.insert(possibleMarkers, obj)
+                yellowSet[obj] = true
+            else
+                local size = obj.AbsoluteSize
+                if (obj:IsA("Frame") or obj:IsA("ImageLabel") or obj:IsA("ImageButton"))
+                    and size.X >= 12 and size.X <= 320 and size.Y >= 3 and size.Y <= 45
+                    and size.X >= size.Y * 1.25 then
+                    table.insert(possibleMarkers, obj)
+                end
+            end
+            local isBlue = isBlueTarget(obj)
+            if isBlue or looksLikeUncoloredTarget(obj) then
+                table.insert(blue, obj)
+                blueSet[obj] = isBlue
+            end
+        end
+
+        local bestPair, bestScore = nil, math.huge
+        for _, marker in ipairs(possibleMarkers) do
+            for _, target in ipairs(blue) do
+                if marker ~= target then
+                    local markerIsYellow = yellowSet[marker] == true
+                    local inferredLane = nil
+                    if not markerIsYellow then
+                        markerIsYellow, inferredLane = looksLikeUncoloredMarker(marker, target)
+                    end
+                    if markerIsYellow then
+                        local mx = marker.AbsolutePosition.X + marker.AbsoluteSize.X * 0.5
+                        local tx = target.AbsolutePosition.X + target.AbsoluteSize.X * 0.5
+                        local lane = inferredLane or getLaneAncestor(marker, target)
+                        if lane then
+                            local laneCenterX = lane.AbsolutePosition.X + lane.AbsoluteSize.X * 0.5
+                            local horizontalGap = math.abs(mx - tx)
+                            local withinLane = math.abs(mx - laneCenterX) <= lane.AbsoluteSize.X * 0.75
+                                and math.abs(tx - laneCenterX) <= lane.AbsoluteSize.X * 0.75
+                            if withinLane and horizontalGap <= math.max(95, lane.AbsoluteSize.X * 0.85) then
+                                local score = lane.AbsoluteSize.Y + horizontalGap * 1.5
+                                if not yellowSet[marker] then score = score + 180 end
+                                -- Prefere o alvo azul/roxo explícito e marcador amarelo por cor.
+                                if not blueSet[target] then score = score + 120 end
+                                if score < bestScore then
+                                    bestScore = score
+                                    bestPair = {Marker = marker, Target = target, Lane = lane}
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Um par visual amarelo/azul dentro de uma barra vertical também identifica o hub
+        -- quando o jogo não dá nomes explícitos às instâncias da interface.
+        return bestPair, namedHub or bestPair ~= nil
+    end
+
+    local function isPairUsable(pair)
+        if not pair or not pair.Marker or not pair.Target or not pair.Lane then return false end
+        local ok, visible = pcall(function()
+            return pair.Marker.Parent ~= nil and pair.Target.Parent ~= nil and pair.Lane.Parent ~= nil
+                and isVisibleGuiObject(pair.Marker) and isVisibleGuiObject(pair.Target)
+                and isVisibleGuiObject(pair.Lane)
+        end)
+        return ok and visible
+    end
+
+    local function pointInsideOurPanel(pos)
+        if not pos or not (ScreenGui and Main and ScreenGui.Enabled) then return false end
+        local ok, inside = pcall(function()
+            local p, z = Main.AbsolutePosition, Main.AbsoluteSize
+            return pos.X >= p.X and pos.X <= p.X + z.X
+                and pos.Y >= p.Y and pos.Y <= p.Y + z.Y
+        end)
+        return ok and inside
+    end
+
+    local function isWaterHit(hit)
+        if not hit then return false end
+        if hit.Material == Enum.Material.Water then return true end
+        local inst = hit.Instance
+        if not inst then return false end
+        local nameBits = {inst.Name}
+        local parent = inst.Parent
+        for _ = 1, 2 do
+            if not parent then break end
+            table.insert(nameBits, parent.Name)
+            parent = parent.Parent
+        end
+        return containsAny(table.concat(nameBits, " "), {
+            "water", "ocean", "sea", "river", "lake", "pond", "water_surface", "water surface"
+        })
+    end
+
+    -- Procura pixels cuja linha de visão termina na água visível. Só é executado quando for lançar.
+    local function findWaterScreenPosition()
+        local cam = workspace.CurrentCamera
+        if not cam then return nil end
+        local vp = cam.ViewportSize
+        if vp.X < 10 or vp.Y < 10 then return nil end
+        local character = player.Character
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = character and {character} or {}
+        params.IgnoreWater = false
+
+        local xFractions = {0.22, 0.34, 0.46, 0.58, 0.70, 0.82, 0.94}
+        local yFractions = {0.44, 0.54, 0.64, 0.74, 0.84, 0.91}
+        local bestPos, bestScore = nil, math.huge
+        for _, yf in ipairs(yFractions) do
+            for _, xf in ipairs(xFractions) do
+                local pos = Vector2.new(vp.X * xf, vp.Y * yf)
+                if not pointInsideOurPanel(pos) then
+                    local ok, ray, hit = pcall(function()
+                        local r = cam:ViewportPointToRay(pos.X, pos.Y)
+                        return r, workspace:Raycast(r.Origin, r.Direction * FISH_CFG.WaterRayLength, params)
+                    end)
+                    if ok and hit and isWaterHit(hit) then
+                        -- Preferência por água visível perto do centro inferior da visão, sem mirar o HUD.
+                        local score = math.abs(xf - 0.52) * 1.0
+                            + math.abs(yf - 0.70) * 0.75
+                            + math.min(hit.Distance / FISH_CFG.WaterRayLength, 1) * 0.12
+                        if score < bestScore then
+                            bestScore, bestPos = score, pos
+                        end
+                    end
+                end
+            end
+        end
+        return bestPos
+    end
+
+    local function clickFishingAt(pos)
+        if not pos then return false end
+        local x, y = math.floor(pos.X), math.floor(pos.Y)
+        local clicked = false
+        if CombatCfg.ClickVIM then
+            local downOk = pcall(function()
+                VirtualInputManager:SendMouseMoveEvent(x, y, game)
+                VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            end)
+            if downOk then
+                task.wait(0.035)
+                pcall(function() VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
+                clicked = true
+            else
+                -- Libera mesmo se a chamada de clique falhar parcialmente.
+                pcall(function() VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
+            end
+        end
+        if not clicked and CombatCfg.ClickVirtualUser then
+            local cam = workspace.CurrentCamera
+            local cf = cam and cam.CFrame or CFrame.new()
+            local ok = pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:Button1Down(pos, cf)
+                task.wait(0.035)
+                VirtualUser:Button1Up(pos, cf)
+            end)
+            clicked = ok
+            if not ok then pcall(function() VirtualUser:Button1Up(pos, cf) end) end
+        end
+        return clicked
+    end
+
+    local function sendMouseHeld(state, preferredPosition)
+        if state == mouseHeld then return end
+        if state then
+            local pos = preferredPosition or getClickPosition()
+            if not pos then
+                local cam = workspace.CurrentCamera
+                local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+                pos = Vector2.new(vp.X * 0.80, vp.Y * 0.50)
+            end
+            local x, y = math.floor(pos.X), math.floor(pos.Y)
+            local backend = nil
+            if CombatCfg.ClickVIM then
+                local ok = pcall(function()
+                    VirtualInputManager:SendMouseMoveEvent(x, y, game)
+                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+                end)
+                if ok then backend = "VIM" end
+            end
+            if not backend and CombatCfg.ClickVirtualUser then
+                local ok = pcall(function()
+                    local cam = workspace.CurrentCamera
+                    VirtualUser:CaptureController()
+                    VirtualUser:Button1Down(pos, cam and cam.CFrame or CFrame.new())
+                end)
+                if ok then backend = "VirtualUser" end
+            end
+            if backend then
+                mouseHeld = true
+                mouseBackend = backend
+                mousePosition = pos
+            else
+                -- Não marca como pressionado se nenhum backend aceitou o comando.
+                mouseHeld = false
+                mouseBackend = nil
+                mousePosition = nil
+            end
+        else
+            local pos = mousePosition or preferredPosition or getClickPosition()
+            if pos and mouseBackend == "VIM" then
+                pcall(function() VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0) end)
+            elseif pos and mouseBackend == "VirtualUser" then
+                pcall(function()
+                    local cam = workspace.CurrentCamera
+                    VirtualUser:Button1Up(pos, cam and cam.CFrame or CFrame.new())
+                end)
+            end
+            if pos then
+                pcall(function() VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0) end)
+            end
+            mouseHeld = false
+            mouseBackend = nil
+            mousePosition = nil
+        end
+    end
+
+    local function getFishingRod()
+        local character = player.Character
+        local backpack = player:FindFirstChildOfClass("Backpack")
+        local function matches(tool)
+            if not tool or not tool:IsA("Tool") then return false end
+            local n = string.lower(tool.Name)
+            return n:find("rod", 1, true) ~= nil
+                or n:find("fishing", 1, true) ~= nil
+                or n:find("fishingpole", 1, true) ~= nil
+                or n:find("fish pole", 1, true) ~= nil
+                or n:find("pole", 1, true) ~= nil
+        end
+        if character then
+            for _, item in ipairs(character:GetChildren()) do
+                if matches(item) then return item, true end
+            end
+        end
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if matches(item) then return item, false end
+            end
+        end
+        return nil, false
+    end
+
+    local function ensureRodEquipped()
+        local tool, equipped = getFishingRod()
+        if not tool then return false end
+        if equipped then return true end
+        local character = player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            pcall(function() humanoid:EquipTool(tool) end)
+            task.wait(0.25)
+            local equippedTool, isEquipped = getFishingRod()
+            return equippedTool ~= nil and isEquipped
+        end
+        return false
+    end
+
+    local function startAutoFishing()
+        if AutoFishing.Enabled then return end
+        AutoFishing.Enabled = true
+        AutoFishing.Token = AutoFishing.Token + 1
+        local token = AutoFishing.Token
+        lastCastAt = -math.huge
+        statusLastWarn = ""
+        ensureGuiTracking()
+        AutoFishing.Status = "procurando vara, água e hub de pesca"
+        AutoFishing.Thread = task.spawn(function()
+            local cachedPair, cachedHubVisible = nil, false
+            local nextHubScanAt = 0
+            local hubMissingSince = nil
+            while isActive(token) do
+                local now = os.clock()
+                -- A posição muda sem trocar a instância: reutiliza o par e só rescaneia ocasionalmente.
+                if cachedPair and not isPairUsable(cachedPair) then
+                    cachedPair = nil
+                    cachedHubVisible = false
+                    nextHubScanAt = 0
+                end
+                if now >= nextHubScanAt then
+                    local previouslyVisible = cachedHubVisible
+                    local ok, pair, hubVisible = pcall(scanFishingHub)
+                    if ok then
+                        if pair and isPairUsable(pair) then
+                            cachedPair = pair
+                        elseif not isPairUsable(cachedPair) then
+                            cachedPair = nil
+                        end
+                        cachedHubVisible = (cachedPair ~= nil) or hubVisible
+                    elseif not isPairUsable(cachedPair) then
+                        cachedPair, cachedHubVisible = nil, false
+                    end
+                    local pairStillValid = isPairUsable(cachedPair)
+                    nextHubScanAt = now + (pairStillValid and FISH_CFG.HubRescanInterval or FISH_CFG.HubScanInterval)
+                    if cachedHubVisible then
+                        hubMissingSince = nil
+                    elseif previouslyVisible then
+                        hubMissingSince = now
+                    end
+                    if not cachedHubVisible and hubMissingSince and now - hubMissingSince >= 0.60 then
+                        -- Só considera a pesca encerrada após a interface ficar ausente por um instante.
+                        lastCastAt = -math.huge
+                        hubMissingSince = nil
+                    end
+                end
+                local pair, hubVisible = cachedPair, cachedHubVisible
+
+                if hubVisible then
+                    if pair and pair.Marker and pair.Target
+                        and pair.Marker.Parent and pair.Target.Parent then
+                        local marker = pair.Marker
+                        local target = pair.Target
+                        local markerY = marker.AbsolutePosition.Y + marker.AbsoluteSize.Y * 0.5
+                        local targetY = target.AbsolutePosition.Y + target.AbsoluteSize.Y * 0.5
+                        local delta = markerY - targetY
+                        local tolerance = math.max(FISH_CFG.CenterTolerancePx, target.AbsoluteSize.Y * 0.10)
+                        local lane = pair.Lane
+                        local laneCenter = Vector2.new(
+                            lane.AbsolutePosition.X + lane.AbsoluteSize.X * 0.5,
+                            lane.AbsolutePosition.Y + lane.AbsoluteSize.Y * 0.5
+                        )
+                        -- O evento de mouse é enviado no trilho do minijogo, não numa posição genérica.
+                        -- Marcador abaixo da bola azul: manter pressionado para subir; acima: soltar.
+                        if delta > tolerance then
+                            sendMouseHeld(true, laneCenter)
+                            AutoFishing.Status = "minijogo: segurando para elevar a linha amarela"
+                        elseif delta < -tolerance then
+                            sendMouseHeld(false, laneCenter)
+                            AutoFishing.Status = "minijogo: soltando para baixar a linha amarela"
+                        else
+                            -- Dentro da tolerância, sempre solta: evita ficar segurando após alinhar.
+                            sendMouseHeld(false, laneCenter)
+                            AutoFishing.Status = "minijogo detectado; marcador alinhado ao alvo"
+                        end
+                    else
+                        sendMouseHeld(false)
+                        AutoFishing.Status = "hub detectado; procurando linha amarela/faixa azul"
+                    end
+                else
+                    sendMouseHeld(false)
+                    AutoFishing.Status = "aguardando hub de pesca"
+                    if os.clock() - lastCastAt >= FISH_CFG.CastRetryDelay then
+                        if ensureRodEquipped() then
+                            -- Procura água visível e lança clicando na coordenada de tela correspondente.
+                            local waterPos = findWaterScreenPosition()
+                            if waterPos then
+                                AutoFishing.Status = "água detectada; lançando a vara"
+                                if clickFishingAt(waterPos) then
+                                    lastCastAt = os.clock()
+                                    task.wait(FISH_CFG.CastSettleDelay)
+                                else
+                                    lastCastAt = os.clock()
+                                    AutoFishing.Status = "falha ao clicar na água; tentando novamente"
+                                end
+                            else
+                                -- Não clica em posição aleatória: espera e volta a procurar água.
+                                lastCastAt = os.clock() - FISH_CFG.CastRetryDelay + FISH_CFG.NoWaterRetryDelay
+                                AutoFishing.Status = "água não visível; ajuste a câmera para a água"
+                            end
+                        else
+                            -- Só tenta de novo com intervalo: evita clicar na tela sem uma vara equipada.
+                            lastCastAt = os.clock() - FISH_CFG.CastRetryDelay + FISH_CFG.NoRodRetryDelay
+                            if statusLastWarn ~= "rod" then
+                                statusLastWarn = "rod"
+                                warn("[RAMDOM HUB] Auto Fish: equipe uma vara de pesca para iniciar.")
+                            end
+                        end
+                    end
+                end
+                task.wait(FISH_CFG.TickRate)
+            end
+            sendMouseHeld(false)
+            AutoFishing.Status = "desligado"
+            AutoFishing.Thread = nil
+        end)
+    end
+
+    local function stopAutoFishing()
+        if not AutoFishing.Enabled then
+            sendMouseHeld(false)
+            return
+        end
+        AutoFishing.Enabled = false
+        AutoFishing.Token = AutoFishing.Token + 1
+        sendMouseHeld(false)
+        if AutoFishing.Thread then
+            pcall(task.cancel, AutoFishing.Thread)
+            AutoFishing.Thread = nil
+        end
+        AutoFishing.Status = "desligado"
+    end
+
+    AutoFishing.Start = startAutoFishing
+    AutoFishing.Stop = stopAutoFishing
+end
+
 --// AUTO RAID — VOO ESTÁVEL (SEM ASSISTÊNCIA DE MIRA INTEGRADA)
 --// ==========================================
 do
@@ -5650,8 +6870,7 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 1, "v1.7", "+ Melhoria no Auto Wood\n- Auto Wood Saiu do Beta", 100)
-createUpdateCard(HomePage, 2, "v1.6", "+ Melhoria no Auto Raid\n+ Adicionado Performance de VFX (Reduz a Qualidade do VFX)", 100)
+createUpdateCard(HomePage, 1, "v1.8", "+ Auto Fish Adicionado (Auto Itens)", 78)
 
 --// ==========================================
 --// ABA COMBAT
@@ -5918,6 +7137,7 @@ local setAutoMob, getAutoMob = createToggleCard(
             if getAutoWood and getAutoWood() then
                 setAutoWood(false)
             end
+            if getAutoFishing and getAutoFishing() then setAutoFishing(false) end
             AutoMob.Start()
         else
             AutoMob.Stop()
@@ -6075,6 +7295,7 @@ setAutoMiner, getAutoMiner = createToggleCard(
             if getAutoWood and getAutoWood() then
                 setAutoWood(false)
             end
+            if getAutoFishing and getAutoFishing() then setAutoFishing(false) end
             AutoMiner.Start()
         else
             AutoMiner.Stop()
@@ -6096,9 +7317,29 @@ setAutoWood, getAutoWood = createToggleCard(
             if getAutoMiner and getAutoMiner() then
                 setAutoMiner(false)
             end
+            if getAutoFishing and getAutoFishing() then setAutoFishing(false) end
             AutoWood.Start()
         else
             AutoWood.Stop()
+        end
+    end
+)
+
+setAutoFishing, getAutoFishing = createToggleCard(
+    AutoMinerPage,
+    3,
+    "Auto Fish",
+    false,
+    function(state)
+        if state then
+            -- Evita que outras rotinas de clique/movimento interfiram com a pesca.
+            if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
+            if getAutoMob and getAutoMob() then setAutoMob(false) end
+            if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
+            if getAutoWood and getAutoWood() then setAutoWood(false) end
+            AutoFishing.Start()
+        else
+            AutoFishing.Stop()
         end
     end
 )
@@ -6118,6 +7359,7 @@ setAutoRaid, getAutoRaid = createToggleCard(
             if getAutoMob and getAutoMob() then setAutoMob(false) end
             if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
             if getAutoWood and getAutoWood() then setAutoWood(false) end
+            if getAutoFishing and getAutoFishing() then setAutoFishing(false) end
             AutoRaid.Start()
         else
             AutoRaid.Stop()
@@ -7116,6 +8358,7 @@ local function destroyScript()
     pcall(AutoMob.Stop)
     pcall(AutoMiner.Stop)
     pcall(AutoWood.Stop)
+    pcall(AutoFishing.Stop)
     if _G.CombatToggleAttack then _G.CombatToggleAttack(false) end
     if _G.CombatToggleSkill then _G.CombatToggleSkill(false) end
     if _G.CombatToggleEquip then _G.CombatToggleEquip(false) end
