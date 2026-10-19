@@ -52,6 +52,8 @@ local setAutoMiner, getAutoMiner
 local setAutoWood, getAutoWood
 local setAutoFishing, getAutoFishing
 local setAutoRaid, getAutoRaid
+local setAutoRaidV2, getAutoRaidV2
+local setAutoRaidAssist, getAutoRaidAssist
 local setLocateStructures, getLocateStructures
 
 --// ==========================================
@@ -276,6 +278,20 @@ local AutoRaid = {
     Target = nil,
     AimPosition = nil,
     HoverHeight = 40, -- altura de teleporte acima do chão detectado
+    PositionMode = "Above", -- "Above" (deitado/voltado para baixo) ou "Normal" (postura padrão)
+    Status = "desligado",
+}
+
+
+--// Auto Raid V2: caminha até um NPC por vez, mantém o alvo até morrer e
+--// integra assistência de mira suave no NPC atual quando estiver a até 12 studs.
+local AutoRaidV2 = {
+    Enabled = false,
+    Token = 0,
+    Thread = nil,
+    Start = nil,
+    Stop = nil,
+    Target = nil,
     Status = "desligado",
 }
 
@@ -5292,6 +5308,16 @@ local FISH_CFG = {
     PostCatchCastDelay = 2.5,
     PostCatchQuietTime = 2.0,
     HubLossGraceInterval = 0.40,
+    -- Não considera o minijogo encerrado após uma única leitura vazia;
+    -- evita que um clique de novo lançamento interrompa uma pesca ainda ativa.
+    HubDisappearConfirmTime = 1.80,
+    -- Após lançar, aguarda tempo suficiente para a mordida/hub aparecer antes
+    -- de tentar outro clique na água (que poderia fechar o minijogo atual).
+    HubAppearTimeout = 20.0,
+    -- Um clique/toque real pode sincronizar o estado do botão com o jogo por um instante;
+    -- não conclui a pesca imediatamente durante essa janela.
+    ManualInputGraceTime = 1.25,
+    NoHubRetryDelay = 3.0,
     NoRodRetryDelay = 1.5,
     NoWaterRetryDelay = 3.0,
     CastSettleDelay = 0.22,
@@ -5317,14 +5343,69 @@ do
     local mousePosition = nil
     local lastCastAt = -math.huge
     local postCatchQuietUntil = 0
+    local lastManualPointerAt = -math.huge
+    local syntheticPointerUntil = 0
+    local inputResyncConnection = nil
     local statusLastWarn = ""
+    local isActive
+
+    local function markSyntheticPointerInput()
+        -- Evita confundir os próprios eventos do Auto Fish com clique/toque do jogador.
+        syntheticPointerUntil = os.clock() + 0.20
+    end
+
+    local function disconnectInputResync()
+        if inputResyncConnection then
+            pcall(function() inputResyncConnection:Disconnect() end)
+            inputResyncConnection = nil
+        end
+    end
+
+    local function connectInputResync(token)
+        disconnectInputResync()
+        inputResyncConnection = UserInputService.InputEnded:Connect(function(input)
+            if not isActive(token) then return end
+            local inputType = input.UserInputType
+            if inputType ~= Enum.UserInputType.MouseButton1
+                and inputType ~= Enum.UserInputType.Touch then
+                return
+            end
+            local now = os.clock()
+            if now <= syntheticPointerUntil then return end
+
+            -- Clique/toque físico pode liberar o mesmo botão que o minijogo usa.
+            -- Invalida apenas o estado guardado; no próximo ciclo o Auto Fish
+            -- calcula novamente se deve segurar ou soltar, sem reiniciar a pesca.
+            lastManualPointerAt = now
+            if mouseHeld then
+                -- Limpa explicitamente o pressionamento simulado antes de reconciliar
+                -- o próximo estado; evita que o clique físico deixe o botão preso/solto.
+                local pos = mousePosition or getClickPosition()
+                local backend = mouseBackend
+                markSyntheticPointerInput()
+                if pos and backend == "VIM" then
+                    pcall(function()
+                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+                    end)
+                elseif pos and backend == "VirtualUser" then
+                    pcall(function()
+                        local cam = workspace.CurrentCamera
+                        VirtualUser:Button1Up(pos, cam and cam.CFrame or CFrame.new())
+                    end)
+                end
+                mouseHeld = false
+                mouseBackend = nil
+                mousePosition = nil
+            end
+        end)
+    end
     local nextGuiTrackingCheck = 0
     -- GUI objects são cacheados por eventos: evita chamar GetDescendants() repetidamente.
     local candidateGuiObjects = setmetatable({}, {__mode = "k"})
     local trackedRoots = setmetatable({}, {__mode = "k"})
     local trackingConnections = {}
 
-    local function isActive(token)
+    isActive = function(token)
         return AutoFishing.Enabled and AutoFishing.Token == token
     end
 
@@ -5764,12 +5845,14 @@ do
         local x, y = math.floor(pos.X), math.floor(pos.Y)
         local clicked = false
         if CombatCfg.ClickVIM then
+            markSyntheticPointerInput()
             local downOk = pcall(function()
                 VirtualInputManager:SendMouseMoveEvent(x, y, game)
                 VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
             end)
             if downOk then
                 task.wait(0.035)
+                markSyntheticPointerInput()
                 pcall(function() VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
                 clicked = true
             else
@@ -5780,10 +5863,12 @@ do
         if not clicked and CombatCfg.ClickVirtualUser then
             local cam = workspace.CurrentCamera
             local cf = cam and cam.CFrame or CFrame.new()
+            markSyntheticPointerInput()
             local ok = pcall(function()
                 VirtualUser:CaptureController()
                 VirtualUser:Button1Down(pos, cf)
                 task.wait(0.035)
+                markSyntheticPointerInput()
                 VirtualUser:Button1Up(pos, cf)
             end)
             clicked = ok
@@ -5804,6 +5889,7 @@ do
             local x, y = math.floor(pos.X), math.floor(pos.Y)
             local backend = nil
             if CombatCfg.ClickVIM then
+                markSyntheticPointerInput()
                 local ok = pcall(function()
                     VirtualInputManager:SendMouseMoveEvent(x, y, game)
                     VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
@@ -5811,6 +5897,7 @@ do
                 if ok then backend = "VIM" end
             end
             if not backend and CombatCfg.ClickVirtualUser then
+                markSyntheticPointerInput()
                 local ok = pcall(function()
                     local cam = workspace.CurrentCamera
                     VirtualUser:CaptureController()
@@ -5831,14 +5918,17 @@ do
         else
             local pos = mousePosition or preferredPosition or getClickPosition()
             if pos and mouseBackend == "VIM" then
+                markSyntheticPointerInput()
                 pcall(function() VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0) end)
             elseif pos and mouseBackend == "VirtualUser" then
+                markSyntheticPointerInput()
                 pcall(function()
                     local cam = workspace.CurrentCamera
                     VirtualUser:Button1Up(pos, cam and cam.CFrame or CFrame.new())
                 end)
-            end
-            if pos then
+            elseif pos then
+                -- Backend desconhecido: envia uma única soltura de segurança.
+                markSyntheticPointerInput()
                 pcall(function() VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0) end)
             end
             mouseHeld = false
@@ -5895,12 +5985,17 @@ do
         lastCastAt = -math.huge
         postCatchQuietUntil = 0
         statusLastWarn = ""
+        lastManualPointerAt = -math.huge
+        syntheticPointerUntil = 0
+        connectInputResync(token)
         ensureGuiTracking()
         AutoFishing.Status = "procurando vara, água e hub de pesca"
         AutoFishing.Thread = task.spawn(function()
             local cachedPair, cachedHubVisible = nil, false
             local nextHubScanAt = 0
             local hubMissingSince = nil
+            local hasSeenHubSinceCast = false
+            local awaitingHubSince = nil
             while isActive(token) do
                 local now = os.clock()
                 local inPostCatchQuiet = now < postCatchQuietUntil
@@ -5927,13 +6022,24 @@ do
                     local pairStillValid = isPairUsable(cachedPair)
                     nextHubScanAt = now + (pairStillValid and FISH_CFG.HubRescanInterval or FISH_CFG.HubScanInterval)
                     if cachedHubVisible then
+                        -- Hub detectado: a vara já entrou no minijogo. Cancela qualquer
+                        -- estado de espera do primeiro aparecimento e bloqueia novos casts.
+                        hasSeenHubSinceCast = true
+                        awaitingHubSince = nil
                         hubMissingSince = nil
                     elseif previouslyVisible then
                         hubMissingSince = now
                     end
-                    if not cachedHubVisible and hubMissingSince and now - hubMissingSince >= 0.60 then
-                        -- Confirma que a captura terminou, mas espera antes de relançar.
-                        -- Antes, -math.huge provocava raycasts + clique imediatamente após sumir o hub.
+                    if hasSeenHubSinceCast and not cachedHubVisible
+                        and hubMissingSince
+                        and now - lastManualPointerAt >= FISH_CFG.ManualInputGraceTime
+                        and now - hubMissingSince >= FISH_CFG.HubDisappearConfirmTime then
+                        -- Só considera a pesca encerrada após várias leituras sem hub.
+                        -- Isso evita que uma leitura perdida dispare um clique na água,
+                        -- que poderia fechar/interromper o minijogo que ainda está ativo.
+                        hasSeenHubSinceCast = false
+                        awaitingHubSince = nil
+                        cachedPair = nil
                         lastCastAt = now - FISH_CFG.CastRetryDelay + FISH_CFG.PostCatchCastDelay
                         postCatchQuietUntil = now + FISH_CFG.PostCatchQuietTime
                         hubMissingSince = nil
@@ -5975,7 +6081,20 @@ do
                 else
                     sendMouseHeld(false)
                     AutoFishing.Status = "aguardando hub de pesca"
-                    if os.clock() - lastCastAt >= FISH_CFG.CastRetryDelay then
+                    if awaitingHubSince then
+                        -- Depois do lançamento, não clique na água de novo enquanto o
+                        -- jogo ainda pode estar esperando a fisgada/abrindo o minijogo.
+                        local waitForHub = now - awaitingHubSince
+                        if waitForHub < FISH_CFG.HubAppearTimeout then
+                            AutoFishing.Status = "vara lançada; aguardando o minijogo de pesca"
+                        else
+                            -- Não apareceu nenhum hub dentro do limite: permite uma nova
+                            -- tentativa após pequena pausa, sem repetir cliques a cada tick.
+                            awaitingHubSince = nil
+                            lastCastAt = now - FISH_CFG.CastRetryDelay + FISH_CFG.NoHubRetryDelay
+                            AutoFishing.Status = "minijogo não apareceu; preparando nova tentativa"
+                        end
+                    elseif os.clock() - lastCastAt >= FISH_CFG.CastRetryDelay then
                         if ensureRodEquipped() then
                             -- Procura água visível e lança clicando na coordenada de tela correspondente.
                             local waterPos = findWaterScreenPosition()
@@ -5983,6 +6102,9 @@ do
                                 AutoFishing.Status = "água detectada; lançando a vara"
                                 if clickFishingAt(waterPos) then
                                     lastCastAt = os.clock()
+                                    awaitingHubSince = lastCastAt
+                                    hasSeenHubSinceCast = false
+                                    hubMissingSince = nil
                                     task.wait(FISH_CFG.CastSettleDelay)
                                 else
                                     lastCastAt = os.clock()
@@ -6006,6 +6128,7 @@ do
                 task.wait(FISH_CFG.TickRate)
             end
             sendMouseHeld(false)
+            disconnectInputResync()
             AutoFishing.Status = "desligado"
             AutoFishing.Thread = nil
         end)
@@ -6018,6 +6141,7 @@ do
         end
         AutoFishing.Enabled = false
         AutoFishing.Token = AutoFishing.Token + 1
+        disconnectInputResync()
         sendMouseHeld(false)
         if AutoFishing.Thread then
             pcall(task.cancel, AutoFishing.Thread)
@@ -6060,7 +6184,7 @@ do
         return nil
     end
 
-    -- Mantém o personagem deitado e voltado para baixo sem depender do alvo de mira.
+    -- Above mantém a postura inclinada atual; Normal conserva o personagem em pé.
     local function getProneFacingCFrame(root)
         if not (root and root.Parent) then return CFrame.new() end
         local forward = root.CFrame.LookVector
@@ -6070,6 +6194,25 @@ do
         end
         local faceDown = root.Position + Vector3.new(0, -1, 0)
         return CFrame.lookAt(root.Position, faceDown, headDirection.Unit)
+    end
+
+    local function getNormalFacingCFrame(root)
+        if not (root and root.Parent) then return CFrame.new() end
+        local look = root.CFrame.LookVector
+        local horizontalLook = Vector3.new(look.X, 0, look.Z)
+        if horizontalLook.Magnitude < 0.05 then
+            horizontalLook = Vector3.new(0, 0, -1)
+        else
+            horizontalLook = horizontalLook.Unit
+        end
+        return CFrame.lookAt(root.Position, root.Position + horizontalLook, Vector3.yAxis)
+    end
+
+    local function getConfiguredFacingCFrame(root)
+        if AutoRaid.PositionMode == "Normal" then
+            return getNormalFacingCFrame(root)
+        end
+        return getProneFacingCFrame(root)
     end
 
     local function findGroundY(char, root)
@@ -6152,36 +6295,78 @@ do
         bg.MaxTorque = Vector3.new(1e8, 1e8, 1e8)
         bg.P = 18000
         bg.D = 1200
-        bg.CFrame = getProneFacingCFrame(root)
+        bg.CFrame = getConfiguredFacingCFrame(root)
         bg.Parent = root
         bodyGyro = bg
 
         pcall(function()
-            hum.AutoRotate = false
-            hum.PlatformStand = true
-            hum:ChangeState(Enum.HumanoidStateType.Physics)
-        end)
-    end
-
-    local function enforceProneOrientation()
-        if not AutoRaid.Enabled or not (activeRoot and activeRoot.Parent) then return end
-        local lockedCFrame = getProneFacingCFrame(activeRoot)
-        if bodyGyro and bodyGyro.Parent == activeRoot then
-            bodyGyro.CFrame = lockedCFrame
-        end
-        pcall(function()
-            activeRoot.CFrame = lockedCFrame
-            activeRoot.AssemblyAngularVelocity = Vector3.zero
-            if activeHumanoid and activeHumanoid.Parent then
-                activeHumanoid.AutoRotate = false
-                activeHumanoid.PlatformStand = true
+            if AutoRaid.PositionMode == "Normal" then
+                hum.AutoRotate = true
+                hum.PlatformStand = false
+                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            else
+                hum.AutoRotate = false
+                hum.PlatformStand = true
+                hum:ChangeState(Enum.HumanoidStateType.Physics)
             end
         end)
     end
 
+    local function enforceConfiguredOrientation()
+        if not AutoRaid.Enabled or not (activeRoot and activeRoot.Parent) then return end
+        local configuredCFrame = getConfiguredFacingCFrame(activeRoot)
+        if bodyGyro and bodyGyro.Parent == activeRoot then
+            bodyGyro.CFrame = configuredCFrame
+        end
+
+        if AutoRaid.PositionMode == "Above" then
+            pcall(function()
+                activeRoot.CFrame = configuredCFrame
+                activeRoot.AssemblyAngularVelocity = Vector3.zero
+                if activeHumanoid and activeHumanoid.Parent then
+                    activeHumanoid.AutoRotate = false
+                    activeHumanoid.PlatformStand = true
+                end
+            end)
+        else
+            -- No modo Normal, não força o CFrame do root a cada frame; deixa o
+            -- Humanoid usar a postura/animação normal enquanto a posição é mantida.
+            pcall(function()
+                if activeHumanoid and activeHumanoid.Parent then
+                    activeHumanoid.AutoRotate = true
+                    activeHumanoid.PlatformStand = false
+                end
+            end)
+        end
+    end
+
     local function onRenderStep()
         if AutoRaid.Enabled then
-            enforceProneOrientation()
+            enforceConfiguredOrientation()
+        end
+    end
+
+    local function setPositionMode(mode)
+        if mode ~= "Above" and mode ~= "Normal" then return end
+        AutoRaid.PositionMode = mode
+        if activeRoot and activeRoot.Parent and activeHumanoid and activeHumanoid.Parent then
+            local configuredCFrame = getConfiguredFacingCFrame(activeRoot)
+            if bodyGyro and bodyGyro.Parent == activeRoot then
+                bodyGyro.CFrame = configuredCFrame
+            end
+            pcall(function()
+                if mode == "Above" then
+                    activeHumanoid.AutoRotate = false
+                    activeHumanoid.PlatformStand = true
+                    activeHumanoid:ChangeState(Enum.HumanoidStateType.Physics)
+                    activeRoot.CFrame = configuredCFrame
+                    activeRoot.AssemblyAngularVelocity = Vector3.zero
+                else
+                    activeHumanoid.PlatformStand = false
+                    activeHumanoid.AutoRotate = true
+                    activeHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+                end
+            end)
         end
     end
 
@@ -6200,7 +6385,7 @@ do
             pcall(function() orientationLockConnection:Disconnect() end)
             orientationLockConnection = nil
         end
-        orientationLockConnection = RunService.PreSimulation:Connect(enforceProneOrientation)
+        orientationLockConnection = RunService.PreSimulation:Connect(enforceConfiguredOrientation)
 
         AutoRaid.Thread = task.spawn(function()
             while isActive(token) do
@@ -6260,6 +6445,7 @@ do
 
     AutoRaid.Start = startAutoRaid
     AutoRaid.Stop = stopAutoRaid
+    AutoRaid.SetPositionMode = setPositionMode
 end
 
 --// ==========================================
@@ -6417,6 +6603,474 @@ do
 
     AutoRaidAssist.Start = startAssist
     AutoRaidAssist.Stop = stopAssist
+end
+
+--// ==========================================
+--// AUTO RAID V2 — segue a pé com W + Shift, alvo exclusivo até a morte
+--// ==========================================
+do
+    local spawnConnection = nil
+    local moveWDown = false
+    local moveShiftDown = false
+    local moving = false
+    local moveSequence = 0
+    local steerPart = nil
+    local STEER_NAME = "RamdomHubAutoRaidV2WalkSteer"
+    local STOP_DISTANCE = 5.5
+    local recovering = false
+    local recoverySafeCFrame = nil
+    local recoveryReturnCFrame = nil
+    local LOW_HEALTH_THRESHOLD = 0.30
+    local RECOVER_HEALTH_THRESHOLD = 0.80
+    local RECOVERY_HEIGHT = 100
+
+    local function isActive(token)
+        return AutoRaidV2.Enabled and AutoRaidV2.Token == token
+    end
+
+    local function getCharacter()
+        local char = player.Character
+        if not char then return nil end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if hum and root and hum.Health > 0 then return char, hum, root end
+        return nil
+    end
+
+    local function findRecoveryCFrames(char, root)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {char}
+        params.IgnoreWater = true
+
+        local origin = root.Position + Vector3.new(0, 8, 0)
+        local hit = workspace:Raycast(origin, Vector3.new(0, -2048, 0), params)
+        local groundPosition
+        if hit then
+            groundPosition = hit.Position
+        else
+            -- Fallback for maps where the floor is not raycastable.
+            groundPosition = root.Position - Vector3.new(0, 3, 0)
+        end
+
+        local rotation = root.CFrame.Rotation
+        local returnPosition = groundPosition + Vector3.new(0, 3.5, 0)
+        local safePosition = groundPosition + Vector3.new(0, RECOVERY_HEIGHT, 0)
+        return CFrame.new(safePosition) * rotation, CFrame.new(returnPosition) * rotation
+    end
+
+    local function zeroCharacterVelocity(root)
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    local function getModelRoot(model)
+        if not (model and model.Parent) then return nil end
+        return model:FindFirstChild("HumanoidRootPart")
+            or model.PrimaryPart
+            or model:FindFirstChild("UpperTorso")
+            or model:FindFirstChild("Torso")
+            or model:FindFirstChild("Head")
+            or model:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function isAliveTarget(model)
+        if not (model and model:IsA("Model") and model.Parent and model:IsDescendantOf(workspace)) then
+            return false
+        end
+        if model == player.Character or Players:GetPlayerFromCharacter(model) then return false end
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        return hum ~= nil and hum.Health > 0 and getModelRoot(model) ~= nil
+    end
+
+    local function isEligibleTarget(model)
+        if not isAliveTarget(model) then return false end
+        if AutoMob.IsValidMob then
+            local ok, valid = pcall(AutoMob.IsValidMob, model)
+            return ok and valid == true
+        end
+        return false
+    end
+
+    local function sendMoveKey(keyCode, down)
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
+        end)
+    end
+
+    local function releaseMoveKeys()
+        -- Solta Shift antes de W para não deixar a corrida presa ao desligar.
+        if moveShiftDown then
+            sendMoveKey(Enum.KeyCode.LeftShift, false)
+            moveShiftDown = false
+        end
+        if moveWDown then
+            sendMoveKey(Enum.KeyCode.W, false)
+            moveWDown = false
+        end
+    end
+
+    local function setMoving(state, immediateShift)
+        if state then
+            if moving then
+                if immediateShift and moveWDown and not moveShiftDown then
+                    sendMoveKey(Enum.KeyCode.LeftShift, true)
+                    moveShiftDown = true
+                end
+                return
+            end
+
+            moving = true
+            moveSequence = moveSequence + 1
+            local thisSequence = moveSequence
+            -- Mesmo fluxo do Auto Farm: primeiro W, depois Shift esquerdo.
+            sendMoveKey(Enum.KeyCode.W, true)
+            moveWDown = true
+            if immediateShift then
+                sendMoveKey(Enum.KeyCode.LeftShift, true)
+                moveShiftDown = true
+            else
+                task.delay(0.35, function()
+                    if AutoRaidV2.Enabled and moving and moveSequence == thisSequence
+                        and moveWDown and not moveShiftDown then
+                        sendMoveKey(Enum.KeyCode.LeftShift, true)
+                        moveShiftDown = true
+                    end
+                end)
+            end
+        else
+            moving = false
+            moveSequence = moveSequence + 1
+            releaseMoveKeys()
+        end
+    end
+
+    local AIM_ASSIST_DISTANCE = 12
+    local AIM_ASSIST_LERP_SPEED = 18
+
+    local function getV2AimPosition(model, fallbackRoot)
+        if model and model.Parent then
+            -- Prioriza o torso para manter a mira no corpo do NPC, sem perseguir
+            -- partes decorativas ou extremidades que se movem muito.
+            local body = model:FindFirstChild("UpperTorso")
+                or model:FindFirstChild("Torso")
+            if body and body:IsA("BasePart") then
+                return body.Position + Vector3.new(0, math.clamp(body.Size.Y * 0.08, 0, 0.35), 0)
+            end
+
+            local humanoidRoot = model:FindFirstChild("HumanoidRootPart")
+            if humanoidRoot and humanoidRoot:IsA("BasePart") then
+                return humanoidRoot.Position + Vector3.new(0, 1.1, 0)
+            end
+
+            local head = model:FindFirstChild("Head")
+            if head and head:IsA("BasePart") then
+                return head.Position - Vector3.new(0, 0.35, 0)
+            end
+        end
+        if fallbackRoot and fallbackRoot.Parent then
+            return fallbackRoot.Position + Vector3.new(0, 1.1, 0)
+        end
+        return nil
+    end
+
+    local function onRenderStep(dt)
+        local part = steerPart
+        if not (AutoRaidV2.Enabled and part and part.Parent) then return end
+        local _, _, root = getCharacter()
+        if not root then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+
+        local cf = cam.CFrame
+        local targetPosition = part.Position
+        local flat = Vector3.new(targetPosition.X - root.Position.X, 0, targetPosition.Z - root.Position.Z)
+        local targetModel = AutoRaidV2.Target
+        local fullAimPosition = getV2AimPosition(targetModel, part)
+        local targetDistance = (targetPosition - root.Position).Magnitude
+        local desired
+
+        if fullAimPosition and targetDistance <= AIM_ASSIST_DISTANCE then
+            -- Assistência integrada do V2: dentro de 12 studs acompanha o torso
+            -- do NPC atualmente selecionado. Não procura nem troca para outros mobs.
+            desired = CFrame.lookAt(cf.Position, fullAimPosition)
+        elseif flat.Magnitude > 0.5 then
+            -- Fora do alcance próximo, preserva a direção horizontal de navegação
+            -- para que W + Shift continue levando o personagem até o mesmo NPC.
+            local dir = flat.Unit
+            local pitch = math.clamp(cf.LookVector.Y, -0.5, 0.5)
+            local h = math.sqrt(1 - pitch * pitch)
+            local look = Vector3.new(dir.X * h, pitch, dir.Z * h)
+            desired = CFrame.lookAt(cf.Position, cf.Position + look)
+        else
+            return
+        end
+
+        -- Suaviza a rotação para evitar trancos de câmera. A posição da câmera não
+        -- é alterada e o personagem continua se movendo pelo controle normal.
+        local alpha = math.clamp((dt or (1 / 60)) * AIM_ASSIST_LERP_SPEED, 0, 1)
+        cam.CFrame = cf:Lerp(desired, alpha)
+    end
+
+    local function enqueueFactory(token)
+        local queue = {}
+        local queued = setmetatable({}, {__mode = "k"})
+        local processed = setmetatable({}, {__mode = "k"})
+
+        local function enqueue(model)
+            if not isActive(token) or not isEligibleTarget(model) then return false end
+            if queued[model] or processed[model] or model == AutoRaidV2.Target then return false end
+            queued[model] = true
+            table.insert(queue, model)
+            return true
+        end
+
+        local function scanWorld(sortByDistance)
+            if not isActive(token) then return end
+            local candidates = {}
+            for _, item in ipairs(workspace:GetDescendants()) do
+                if item:IsA("Humanoid") then
+                    local model = item.Parent
+                    if isEligibleTarget(model) and not queued[model] and not processed[model]
+                        and model ~= AutoRaidV2.Target then
+                        table.insert(candidates, model)
+                        queued[model] = true
+                    end
+                end
+            end
+            if sortByDistance then
+                local _, _, root = getCharacter()
+                if root then
+                    table.sort(candidates, function(a, b)
+                        local ar, br = getModelRoot(a), getModelRoot(b)
+                        local ad = ar and (ar.Position - root.Position).Magnitude or math.huge
+                        local bd = br and (br.Position - root.Position).Magnitude or math.huge
+                        return ad < bd
+                    end)
+                end
+            end
+            for _, model in ipairs(candidates) do table.insert(queue, model) end
+        end
+
+        local function popNext()
+            while #queue > 0 do
+                local model = table.remove(queue, 1)
+                queued[model] = nil
+                if isEligibleTarget(model) then
+                    processed[model] = true
+                    return model
+                end
+            end
+            return nil
+        end
+
+        return enqueue, scanWorld, popNext
+    end
+
+    local function startAutoRaidV2()
+        if AutoRaidV2.Enabled then return end
+        AutoRaidV2.Enabled = true
+        AutoRaidV2.Token = AutoRaidV2.Token + 1
+        local token = AutoRaidV2.Token
+        AutoRaidV2.Target = nil
+        AutoRaidV2.Status = "procurando NPCs"
+        recovering = false
+        recoverySafeCFrame = nil
+        recoveryReturnCFrame = nil
+        steerPart = nil
+        setMoving(false)
+
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 1, onRenderStep)
+
+        local enqueue, scanWorld, popNext = enqueueFactory(token)
+        -- Ouve novos spawns e faz uma varredura inicial do mundo.
+        if spawnConnection then pcall(function() spawnConnection:Disconnect() end) end
+        spawnConnection = workspace.DescendantAdded:Connect(function(item)
+            if not isActive(token) or not item:IsA("Humanoid") then return end
+            task.delay(0.3, function()
+                for _ = 1, 5 do
+                    if not isActive(token) then return end
+                    local model = item.Parent
+                    if model and model:IsA("Model") and enqueue(model) then return end
+                    task.wait(0.25)
+                end
+            end)
+        end)
+        scanWorld(true)
+
+        AutoRaidV2.Thread = task.spawn(function()
+            local lastEmptyScan = os.clock()
+            local bestDistance = math.huge
+            local progressAt = os.clock()
+            local currentTarget = nil
+
+            while isActive(token) do
+                local char, hum, root = getCharacter()
+                if not (char and hum and root) then
+                    setMoving(false)
+                    steerPart = nil
+                    -- A respawn invalidates the old avatar's recovery positions.
+                    recovering = false
+                    recoverySafeCFrame = nil
+                    recoveryReturnCFrame = nil
+                    AutoRaidV2.Status = "aguardando seu personagem"
+                    task.wait(0.25)
+                else
+                    local now = os.clock()
+                    local healthRatio = hum.MaxHealth > 0 and (hum.Health / hum.MaxHealth) or 1
+
+                    -- At 30% health or lower, pause the raid and move to a safe point
+                    -- roughly 100 studs above the ground. Keep the existing NPC queued.
+                    if not recovering and healthRatio <= LOW_HEALTH_THRESHOLD then
+                        setMoving(false)
+                        steerPart = nil
+                        pcall(function() hum:MoveTo(root.Position) end)
+                        recoverySafeCFrame, recoveryReturnCFrame = findRecoveryCFrames(char, root)
+                        recovering = true
+                        zeroCharacterVelocity(root)
+                        pcall(function() root.CFrame = recoverySafeCFrame end)
+                        zeroCharacterVelocity(root)
+                        AutoRaidV2.Status = string.format("recuperando vida (%.0f%%)", healthRatio * 100)
+                        task.wait(0.20)
+
+                    elseif recovering then
+                        setMoving(false)
+                        steerPart = nil
+                        pcall(function() hum:MoveTo(root.Position) end)
+
+                        if healthRatio >= RECOVER_HEALTH_THRESHOLD then
+                            -- Return to the ground area and resume walking toward the same
+                            -- NPC if it is still alive; the queue/target is deliberately kept.
+                            if recoveryReturnCFrame then
+                                pcall(function() root.CFrame = recoveryReturnCFrame end)
+                                zeroCharacterVelocity(root)
+                            end
+                            recovering = false
+                            recoverySafeCFrame = nil
+                            recoveryReturnCFrame = nil
+                            AutoRaidV2.Status = "vida recuperada; voltando aos NPCs"
+                            task.wait(0.25)
+                        else
+                            -- Correct small physics drift so the character remains near the
+                            -- recovery height, but avoid reapplying the CFrame unnecessarily.
+                            if recoverySafeCFrame
+                                and (root.Position - recoverySafeCFrame.Position).Magnitude > 0.75 then
+                                pcall(function() root.CFrame = recoverySafeCFrame end)
+                                zeroCharacterVelocity(root)
+                            end
+                            AutoRaidV2.Status = string.format("recuperando vida (%.0f%%)", healthRatio * 100)
+                            task.wait(0.20)
+                        end
+
+                    else
+                        local target = AutoRaidV2.Target
+                        if not isAliveTarget(target) then
+                            AutoRaidV2.Target = nil
+                            target = popNext()
+                            setMoving(false)
+                            steerPart = nil
+                            if target then
+                                AutoRaidV2.Target = target
+                                currentTarget = target
+                                bestDistance = math.huge
+                                progressAt = now
+                                AutoRaidV2.Status = "indo até " .. tostring(target.Name)
+                            else
+                                currentTarget = nil
+                                AutoRaidV2.Status = "aguardando próximo NPC"
+                                if now - lastEmptyScan >= 1.25 then
+                                    scanWorld(false)
+                                    lastEmptyScan = now
+                                end
+                                task.wait(0.22)
+                            end
+                        end
+
+                        target = AutoRaidV2.Target
+                        if target and isAliveTarget(target) then
+                            local targetRoot = getModelRoot(target)
+                            if targetRoot then
+                                steerPart = targetRoot
+                                local delta = targetRoot.Position - root.Position
+                                local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
+                                local distance = horizontalDelta.Magnitude
+
+                                if target ~= currentTarget then
+                                    currentTarget = target
+                                    bestDistance = distance
+                                    progressAt = now
+                                end
+
+                                if distance > STOP_DISTANCE then
+                                    setMoving(true)
+                                    AutoRaidV2.Status = "indo até " .. tostring(target.Name)
+                                    if distance < bestDistance - 0.75 then
+                                        bestDistance = distance
+                                        progressAt = now
+                                    end
+                                    -- Keep the same NPC until it dies/disappears; slow movement
+                                    -- does not cause target switching.
+                                else
+                                    setMoving(false)
+                                    pcall(function() hum:MoveTo(root.Position) end)
+                                    bestDistance = distance
+                                    progressAt = now
+                                    AutoRaidV2.Status = "atacando " .. tostring(target.Name)
+                                end
+                            else
+                                setMoving(false)
+                                steerPart = nil
+                                AutoRaidV2.Status = "aguardando posição de " .. tostring(target.Name)
+                            end
+                            task.wait(0.12)
+                        end
+                    end
+                end
+            end
+            setMoving(false)
+            steerPart = nil
+            AutoRaidV2.Thread = nil
+        end)
+    end
+
+    local function stopAutoRaidV2()
+        if not AutoRaidV2.Enabled then return end
+        AutoRaidV2.Enabled = false
+        AutoRaidV2.Token = AutoRaidV2.Token + 1
+        AutoRaidV2.Target = nil
+        AutoRaidV2.Status = "desligado"
+        setMoving(false)
+        steerPart = nil
+        if recovering then
+            local _, _, recoveryRoot = getCharacter()
+            if recoveryRoot and recoveryReturnCFrame then
+                pcall(function() recoveryRoot.CFrame = recoveryReturnCFrame end)
+                zeroCharacterVelocity(recoveryRoot)
+            end
+        end
+        recovering = false
+        recoverySafeCFrame = nil
+        recoveryReturnCFrame = nil
+        if AutoRaidV2.Thread then
+            pcall(task.cancel, AutoRaidV2.Thread)
+            AutoRaidV2.Thread = nil
+        end
+        if spawnConnection then
+            pcall(function() spawnConnection:Disconnect() end)
+            spawnConnection = nil
+        end
+        pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        local _, hum, root = getCharacter()
+        if hum and root then
+            pcall(function() hum:MoveTo(root.Position) end)
+        end
+    end
+
+    AutoRaidV2.Start = startAutoRaidV2
+    AutoRaidV2.Stop = stopAutoRaidV2
 end
 
 --// ==========================================
@@ -6665,6 +7319,7 @@ Title.TextSize = 18
 Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.ZIndex = 4
 Title.Parent = Header
+-- Mantém o nome RAMDOM HUB com cor normal (branco), sem degradê.
 
 local Subtitle = Instance.new("TextLabel")
 Subtitle.Size = UDim2.new(1, -180, 0, 16)
@@ -6787,7 +7442,9 @@ local Pages = {}
 local Tabs = {}
 
 local function createPage(name)
-    local page = Instance.new("Frame")
+    -- Raid has enough controls to overflow the viewport, so make this page scrollable.
+    local isScrollableRaid = name == "AutoRaid"
+    local page = Instance.new(isScrollableRaid and "ScrollingFrame" or "Frame")
     page.Name = name
     page.Size = UDim2.new(1, 0, 1, 0)
     page.BackgroundTransparency = 1
@@ -6795,10 +7452,29 @@ local function createPage(name)
     page.ZIndex = 2
     page.Parent = ContentHolder
 
+    if isScrollableRaid then
+        page.BorderSizePixel = 0
+        page.Active = true
+        page.ClipsDescendants = true
+        page.ScrollingDirection = Enum.ScrollingDirection.Y
+        page.ScrollBarThickness = 4
+        page.ScrollBarImageColor3 = Theme.Accent1
+        page.ScrollBarImageTransparency = 0.25
+        page.CanvasPosition = Vector2.new(0, 0)
+        page.CanvasSize = UDim2.new(0, 0, 0, 0)
+        page.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+    end
+
     local layout = Instance.new("UIListLayout")
     layout.Padding = UDim.new(0, 10)
     layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Parent = page
+
+    if isScrollableRaid then
+        layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            page.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 12)
+        end)
+    end
 
     Pages[name] = page
     return page
@@ -6849,41 +7525,37 @@ local function createTabButton(id, label, order)
     btn.ZIndex = 3
     btn.Parent = Sidebar
     addCorner(btn, 8)
+    -- Degradê roxo-azul aplicado à aba quando ela estiver selecionada.
+    btn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    addGradient(btn, Theme.Accent1, Theme.Accent2, 0)
 
     local textLabel = Instance.new("TextLabel")
-    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.Name = "TabLabel"
+    textLabel.Size = UDim2.new(1, -24, 1, 0)
+    textLabel.Position = UDim2.new(0, 12, 0, 0)
     textLabel.BackgroundTransparency = 1
     textLabel.Text = label
-    textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    textLabel.TextColor3 = Color3.fromRGB(205, 214, 235)
     textLabel.Font = Enum.Font.GothamBold
-    textLabel.TextSize = 14
+    textLabel.TextSize = 13
     textLabel.TextXAlignment = Enum.TextXAlignment.Left
     textLabel.ZIndex = 4
     textLabel.Parent = btn
 
-    local textPad = Instance.new("UIPadding")
-    textPad.PaddingLeft = UDim.new(0, 16)
-    textPad.Parent = textLabel
-
-    local textGrad = Instance.new("UIGradient")
-    textGrad.Color = ColorSequence.new{
-        ColorSequenceKeypoint.new(0, Theme.Accent1),
-        ColorSequenceKeypoint.new(1, Theme.Accent2),
-    }
-    textGrad.Parent = textLabel
+    local selectedStroke = addStroke(btn, Color3.fromRGB(42, 120, 255), 1, 1)
 
     local indicator = Instance.new("Frame")
     indicator.Name = "Indicator"
-    indicator.Size = UDim2.new(0, 4, 0.6, 0)
-    indicator.Position = UDim2.new(0, 0, 0.5, -12)
-    indicator.BackgroundColor3 = Theme.Accent1
+    indicator.Size = UDim2.new(0, 3, 0.82, 0)
+    indicator.Position = UDim2.new(0, 0, 0.5, -16)
+    indicator.BackgroundColor3 = Color3.fromRGB(63, 171, 255)
     indicator.BorderSizePixel = 0
     indicator.Visible = false
     indicator.ZIndex = 5
     indicator.Parent = btn
     addCorner(indicator, 2)
 
-    Tabs[id] = {btn = btn, indicator = indicator, textLabel = textLabel}
+    Tabs[id] = {btn = btn, indicator = indicator, textLabel = textLabel, selectedStroke = selectedStroke}
     return btn
 end
 
@@ -6903,11 +7575,15 @@ local function setTab(id)
         data.indicator.Visible = active
         if active then
             data.btn.BackgroundTransparency = 0
-            data.btn.BackgroundColor3 = Theme.Card
+            data.btn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+            if data.selectedStroke then data.selectedStroke.Transparency = 0.28 end
             data.textLabel.TextTransparency = 0
+            data.textLabel.TextColor3 = Color3.fromRGB(245, 248, 255)
         else
             data.btn.BackgroundTransparency = 1
-            data.textLabel.TextTransparency = 0.2
+            if data.selectedStroke then data.selectedStroke.Transparency = 1 end
+            data.textLabel.TextTransparency = 0.08
+            data.textLabel.TextColor3 = Color3.fromRGB(190, 201, 224)
         end
     end
     for name, page in pairs(Pages) do
@@ -7274,6 +7950,7 @@ local setAutoMob, getAutoMob = createToggleCard(
     function(state)
         if state then
             if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
+            if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
             if getAutoMiner and getAutoMiner() then
                 setAutoMiner(false)
             end
@@ -7432,6 +8109,7 @@ setAutoMiner, getAutoMiner = createToggleCard(
     function(state)
         if state then
             if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
+            if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
             if getAutoMob and getAutoMob() then
                 setAutoMob(false)
             end
@@ -7454,6 +8132,7 @@ setAutoWood, getAutoWood = createToggleCard(
     function(state)
         if state then
             if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
+            if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
             if getAutoMob and getAutoMob() then
                 setAutoMob(false)
             end
@@ -7477,6 +8156,7 @@ setAutoFishing, getAutoFishing = createToggleCard(
         if state then
             -- Evita que outras rotinas de clique/movimento interfiram com a pesca.
             if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
+            if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
             if getAutoMob and getAutoMob() then setAutoMob(false) end
             if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
             if getAutoWood and getAutoWood() then setAutoWood(false) end
@@ -7498,6 +8178,8 @@ setAutoRaid, getAutoRaid = createToggleCard(
     false,
     function(state)
         if state then
+            if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
+            if getAutoRaidAssist and getAutoRaidAssist() then setAutoRaidAssist(false) else AutoRaidAssist.Stop() end
             -- Evita que os outros sistemas de deslocamento disputem o controle do personagem.
             if getAutoMob and getAutoMob() then setAutoMob(false) end
             if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
@@ -7510,14 +8192,100 @@ setAutoRaid, getAutoRaid = createToggleCard(
     end
 )
 
---// Assistência de mira independente do Auto Raid
-local setAutoRaidAssist, getAutoRaidAssist = createToggleCard(
+setAutoRaidV2, getAutoRaidV2 = createToggleCard(
     AutoRaidPage,
     2,
+    "Auto Raid V2",
+    false,
+    function(state)
+        if state then
+            -- A V2 caminha até um NPC por vez e não deve competir com a V1/mira automática.
+            if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
+            if getAutoRaidAssist and getAutoRaidAssist() then setAutoRaidAssist(false) else AutoRaidAssist.Stop() end
+            if getAutoMob and getAutoMob() then setAutoMob(false) end
+            if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
+            if getAutoWood and getAutoWood() then setAutoWood(false) end
+            if getAutoFishing and getAutoFishing() then setAutoFishing(false) end
+            AutoRaidV2.Start()
+        else
+            AutoRaidV2.Stop()
+        end
+    end
+)
+
+--// Seletor de posição do Auto Raid: apenas Above e Normal.
+local AutoRaidPositionCard = Instance.new("Frame")
+AutoRaidPositionCard.Name = "AutoRaidPositionCard"
+AutoRaidPositionCard.Size = UDim2.new(1, 0, 0, 88)
+AutoRaidPositionCard.BackgroundColor3 = Theme.Card
+AutoRaidPositionCard.BorderSizePixel = 0
+AutoRaidPositionCard.LayoutOrder = 6
+AutoRaidPositionCard.Parent = AutoRaidPage
+addCorner(AutoRaidPositionCard, 14)
+addStroke(AutoRaidPositionCard, Theme.Stroke, 1, 0.5)
+addGradient(AutoRaidPositionCard, Theme.CardHover, Theme.Card, 90)
+
+local AutoRaidPositionTitle = Instance.new("TextLabel")
+AutoRaidPositionTitle.Name = "PositionTitle"
+AutoRaidPositionTitle.Size = UDim2.new(1, -32, 0, 22)
+AutoRaidPositionTitle.Position = UDim2.new(0, 16, 0, 8)
+AutoRaidPositionTitle.BackgroundTransparency = 1
+AutoRaidPositionTitle.Text = "Posição do personagem"
+AutoRaidPositionTitle.TextColor3 = Theme.Text
+AutoRaidPositionTitle.Font = Enum.Font.GothamBold
+AutoRaidPositionTitle.TextSize = 13
+AutoRaidPositionTitle.TextXAlignment = Enum.TextXAlignment.Left
+AutoRaidPositionTitle.Parent = AutoRaidPositionCard
+
+local function createAutoRaidPositionButton(name, label, xScale, xOffset, width)
+    local button = Instance.new("TextButton")
+    button.Name = name
+    button.Size = UDim2.new(0.5, -22, 0, 34)
+    button.Position = UDim2.new(xScale, xOffset, 0, 42)
+    button.BackgroundColor3 = Theme.TrackOff
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = false
+    button.Text = label
+    button.TextColor3 = Theme.Text
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 12
+    button.Parent = AutoRaidPositionCard
+    addCorner(button, 9)
+    addStroke(button, Theme.Stroke, 1, 0.4)
+    return button
+end
+
+local AutoRaidAboveButton = createAutoRaidPositionButton("AbovePositionButton", "Above", 0, 14, 0)
+local AutoRaidNormalButton = createAutoRaidPositionButton("NormalPositionButton", "Normal", 0.5, 8, 0)
+
+local function renderAutoRaidPositionButtons()
+    local aboveSelected = AutoRaid.PositionMode == "Above"
+    AutoRaidAboveButton.BackgroundColor3 = aboveSelected and Theme.Accent1 or Theme.TrackOff
+    AutoRaidNormalButton.BackgroundColor3 = (not aboveSelected) and Theme.Accent1 or Theme.TrackOff
+    AutoRaidAboveButton.TextColor3 = aboveSelected and Color3.new(1, 1, 1) or Theme.Text
+    AutoRaidNormalButton.TextColor3 = (not aboveSelected) and Color3.new(1, 1, 1) or Theme.Text
+end
+
+AutoRaidAboveButton.MouseButton1Click:Connect(function()
+    AutoRaid.SetPositionMode("Above")
+    renderAutoRaidPositionButtons()
+end)
+
+AutoRaidNormalButton.MouseButton1Click:Connect(function()
+    AutoRaid.SetPositionMode("Normal")
+    renderAutoRaidPositionButtons()
+end)
+renderAutoRaidPositionButtons()
+
+--// Assistência de mira independente do Auto Raid
+setAutoRaidAssist, getAutoRaidAssist = createToggleCard(
+    AutoRaidPage,
+    4,
     "Assistência de Mira",
     false,
     function(state)
         if state then
+            if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
             AutoRaidAssist.Start()
         else
             AutoRaidAssist.Stop()
@@ -7531,7 +8299,7 @@ AutoRaidDistanceCard.Name = "AutoRaidDistanceCard"
 AutoRaidDistanceCard.Size = UDim2.new(1, 0, 0, 88)
 AutoRaidDistanceCard.BackgroundColor3 = Theme.Card
 AutoRaidDistanceCard.BorderSizePixel = 0
-AutoRaidDistanceCard.LayoutOrder = 3
+AutoRaidDistanceCard.LayoutOrder = 5
 AutoRaidDistanceCard.Parent = AutoRaidPage
 addCorner(AutoRaidDistanceCard, 14)
 addStroke(AutoRaidDistanceCard, Theme.Stroke, 1, 0.5)
