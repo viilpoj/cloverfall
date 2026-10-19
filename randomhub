@@ -1,8 +1,12 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.8                     ║
+    ║                 RAMDOM HUB  v1.9                     ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
+
+    v1.9:
+      + Adicionado Bypass Voo
+      + Melhoria no Auto Farm
 
     v1.8:
       + Auto Fish Adicionado (Auto Itens)
@@ -21,6 +25,7 @@ local VirtualUser = game:GetService("VirtualUser")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local GuiService = game:GetService("GuiService")
 local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
@@ -38,11 +43,68 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.8",
+    Version = "1.9",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
 }
+
+
+--// Configurações persistentes do Bypass Voo.
+--// O arquivo é usado quando o executor oferece readfile/writefile; caso contrário,
+--// o estado permanece em _G durante reexecuções na mesma sessão.
+local HUB_SETTINGS_PATH = "RamdomHubSettings.json"
+local HUB_SETTINGS = {}
+do
+    local existing = rawget(_G, "__RamdomHubSettings")
+    if type(existing) == "table" then
+        for key, value in pairs(existing) do
+            HUB_SETTINGS[key] = value
+        end
+    end
+
+    if type(isfile) == "function" and type(readfile) == "function" then
+        pcall(function()
+            if isfile(HUB_SETTINGS_PATH) then
+                local decoded = HttpService:JSONDecode(readfile(HUB_SETTINGS_PATH))
+                if type(decoded) == "table" then
+                    for key, value in pairs(decoded) do
+                        HUB_SETTINGS[key] = value
+                    end
+                end
+            end
+        end)
+    end
+
+    -- Migração única: ao instalar esta revisão, iniciar com Bypass Voo desligado.
+    -- Depois que o usuário escolher um estado, ele continua sendo salvo normalmente.
+    if HUB_SETTINGS.BypassVooDefaultOffV19 ~= true then
+        HUB_SETTINGS.BypassVoo = false
+        HUB_SETTINGS.BypassVooDefaultOffV19 = true
+    end
+    HUB_SETTINGS.BypassVoo = HUB_SETTINGS.BypassVoo == true
+    HUB_SETTINGS.FlightSpeed = math.clamp(tonumber(HUB_SETTINGS.FlightSpeed) or 100, 10, 200)
+    _G.__RamdomHubSettings = HUB_SETTINGS
+end
+
+local function saveHubSettings()
+    _G.__RamdomHubSettings = HUB_SETTINGS
+    if type(writefile) ~= "function" then return end
+
+    local ok, encoded = pcall(function()
+        return HttpService:JSONEncode({
+            BypassVoo = HUB_SETTINGS.BypassVoo == true,
+            FlightSpeed = math.clamp(tonumber(HUB_SETTINGS.FlightSpeed) or 100, 10, 200),
+            BypassVooDefaultOffV19 = HUB_SETTINGS.BypassVooDefaultOffV19 == true,
+        })
+    end)
+    if ok and type(encoded) == "string" then
+        pcall(function() writefile(HUB_SETTINGS_PATH, encoded) end)
+    end
+end
+
+-- Persiste a migração para que o estado inicial desligado seja aplicado só uma vez.
+saveHubSettings()
 
 --// UI principal
 local ScreenGui, Main
@@ -103,6 +165,8 @@ local AutoMob = {
     MakeKey = nil,
     Status = "desligado",
     OnStatus = nil,
+    BypassVoo = HUB_SETTINGS.BypassVoo,
+    FlightSpeed = HUB_SETTINGS.FlightSpeed,
     Target = nil,            
     SelectedTypes = {},      
     SelectionVersion = 0,    
@@ -884,9 +948,10 @@ do
     local steerPart = nil
 
     local function sendMoveKey(keyCode, down)
-        pcall(function()
+        local ok = pcall(function()
             VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
         end)
+        return ok
     end
 
     local function releaseMoveKeys()
@@ -941,6 +1006,725 @@ do
             moveSequence = moveSequence + 1 -- invalida qualquer atraso pendente
             releaseMoveKeys()
         end
+    end
+
+    --// Bypass Voo: rota em três etapas, com velocidade limitada pelo slider.
+    --// A altitude de voo acompanha a coordenada Y atual do NPC: positiva ou negativa conforme necessário.
+    local flight = {
+        HeartbeatConnection = nil,
+        Target = nil,
+        TargetReach = MOB_CFG.StopDistance,
+        CompletedTarget = nil,
+        ModeRequested = false,
+        ModeOwned = false,
+        RespawnReactivating = false,
+        Character = nil,
+        ControlledRoot = nil,
+        Stage = "Parado",
+        GroundY = nil,
+        AltitudeY = nil,
+        HorizontalTolerance = 2.5,
+        VerticalTolerance = 1.25,
+        GroundRayDistance = 10000,
+        -- Ao chegar a 50 studs do alvo atual, o restante da aproximação
+        -- volta ao sistema normal de movimentação já integrado ao Auto Farm.
+        FlightHandoffDistance = 50,
+        NormalHandoffTarget = nil,
+        -- Recuperação quando a altitude deixa de mudar durante subida/descida.
+        StallTimeout = 0.85,
+        StallMinVerticalProgress = 0.35,
+        StallRecoveryDuration = 1.75,
+        StallRecoveryCooldown = 2.0,
+        StallCheckStage = nil,
+        StallAnchorY = nil,
+        StallProgressAt = nil,
+        LastStallRecoveryAt = -math.huge,
+        RecoveryUntil = 0,
+        RecoveryReturnStage = nil,
+        -- Desvio lateral ao detectar parede/peça física na trajetória horizontal.
+        ObstacleRayDistance = 6.0,
+        ObstacleSideProbeDistance = 7.0,
+        ObstacleCheckInterval = 0.12,
+        ObstacleSidestepDuration = 0.5,
+        ObstacleSidestepCooldown = 0.45,
+        ObstacleSidestepUntil = 0,
+        ObstacleSidestepDirection = nil,
+        ObstacleSidestepReturnStage = nil,
+        NextObstacleCheckAt = 0,
+        ObstacleSideSign = 1,
+    }
+    local stopFlightMode
+
+    local function tapFlightToggle()
+        -- sendMoveKey retorna agora o resultado real do envio (pcall), usado
+        -- para não confundir um envio bem-sucedido com falha de ativação.
+        local downSent = sendMoveKey(Enum.KeyCode.H, true)
+        task.wait(0.045)
+        sendMoveKey(Enum.KeyCode.H, false)
+        return downSent == true
+    end
+
+    local function hasFlightIndicator(char, hum, root)
+        local stateOk, humState = pcall(function() return hum:GetState() end)
+        if stateOk and humState == Enum.HumanoidStateType.Flying then
+            return true
+        end
+
+        local attributeNames = {"IsFlying", "Flying", "FlightActive", "FlightEnabled", "FlyEnabled"}
+        for _, instance in ipairs({char, hum, root}) do
+            if instance then
+                for _, attributeName in ipairs(attributeNames) do
+                    if instance:GetAttribute(attributeName) == true then return true end
+                end
+            end
+        end
+
+        local ok, descendants = pcall(function() return char:GetDescendants() end)
+        if ok then
+            for _, obj in ipairs(descendants) do
+                local name = string.lower(tostring(obj.Name or "")):gsub("[%s_%-]", "")
+                if obj:IsA("BoolValue") and obj.Value
+                    and (name == "flying" or name == "isflying" or name == "flightactive" or name == "flyenabled") then
+                    return true
+                end
+                local flightNamed = name:find("flight", 1, true) or name:find("fly", 1, true)
+                if flightNamed and (obj:IsA("BodyVelocity") or obj:IsA("LinearVelocity")
+                    or obj:IsA("VectorForce") or obj:IsA("BodyPosition") or obj:IsA("AlignPosition")
+                    or obj:IsA("BodyGyro") or obj:IsA("AlignOrientation")) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function pauseFlightMotion()
+        flight.Target = nil
+        flight.Stage = "Parado"
+        flight.GroundY = nil
+        flight.AltitudeY = nil
+        flight.StallCheckStage = nil
+        flight.StallAnchorY = nil
+        flight.StallProgressAt = nil
+        flight.LastStallRecoveryAt = -math.huge
+        flight.RecoveryUntil = 0
+        flight.RecoveryReturnStage = nil
+        flight.ObstacleSidestepUntil = 0
+        flight.ObstacleSidestepDirection = nil
+        flight.ObstacleSidestepReturnStage = nil
+        flight.NextObstacleCheckAt = 0
+        local controlledRoot = flight.ControlledRoot
+        if controlledRoot and controlledRoot.Parent then
+            pcall(function() controlledRoot.AssemblyLinearVelocity = Vector3.zero end)
+        end
+        flight.ControlledRoot = nil
+    end
+
+    local function getGroundLevel(char, hum, root)
+        local exclusions = {char}
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = exclusions
+        params.IgnoreWater = true
+        pcall(function() params.RespectCanCollide = true end)
+
+        local origin = root.Position + Vector3.new(0, 1, 0)
+        local down = Vector3.new(0, -flight.GroundRayDistance, 0)
+        -- Ignora NPCs com Humanoid encontrados diretamente abaixo do personagem
+        -- para medir o piso/superfície de suporte, e não o corpo de outro NPC.
+        for _ = 1, 12 do
+            local result = workspace:Raycast(origin, down, params)
+            if not result then break end
+            local ancestor = result.Instance
+            local humanoidModel = nil
+            while ancestor and ancestor ~= workspace do
+                if ancestor:IsA("Model") and ancestor:FindFirstChildOfClass("Humanoid") then
+                    humanoidModel = ancestor
+                    break
+                end
+                ancestor = ancestor.Parent
+            end
+            if humanoidModel then
+                table.insert(exclusions, humanoidModel)
+                params.FilterDescendantsInstances = exclusions
+            else
+                return result.Position.Y
+            end
+        end
+
+        -- Fallback se o jogo não permitir raycast até o piso.
+        return root.Position.Y - math.max(2, hum.HipHeight + root.Size.Y * 0.5)
+    end
+
+    -- Retorna true quando inicia a recuperação. Mede progresso real em Y,
+    -- não apenas a velocidade solicitada, e por isso detecta bloqueios físicos.
+    flight.CheckVerticalStall = function(stage, shouldMoveVertically, root, targetRoot, speed)
+        if not shouldMoveVertically then
+            flight.StallCheckStage = nil
+            flight.StallAnchorY = nil
+            flight.StallProgressAt = nil
+            return false
+        end
+
+        local now = os.clock()
+        if flight.StallCheckStage ~= stage or flight.StallAnchorY == nil then
+            flight.StallCheckStage = stage
+            flight.StallAnchorY = root.Position.Y
+            flight.StallProgressAt = now
+            return false
+        end
+
+        if math.abs(root.Position.Y - flight.StallAnchorY) >= flight.StallMinVerticalProgress then
+            flight.StallAnchorY = root.Position.Y
+            flight.StallProgressAt = now
+            return false
+        end
+
+        if now - (flight.StallProgressAt or now) < flight.StallTimeout
+            or now - (flight.LastStallRecoveryAt or -math.huge) < flight.StallRecoveryCooldown then
+            return false
+        end
+
+        flight.LastStallRecoveryAt = now
+        flight.RecoveryReturnStage = stage
+        flight.RecoveryUntil = now + flight.StallRecoveryDuration
+        flight.Stage = "RecuperandoFrente"
+        flight.StallCheckStage = nil
+        flight.StallAnchorY = nil
+        flight.StallProgressAt = nil
+
+        -- Avança na direção horizontal do NPC por 1,75 s; depois retoma a mesma
+        -- etapa vertical e volta a tentar subir/descer conforme a diferença de Y.
+        local forward = Vector3.new(
+            targetRoot.Position.X - root.Position.X,
+            0,
+            targetRoot.Position.Z - root.Position.Z
+        )
+        if forward.Magnitude < 0.1 then
+            local look = root.CFrame.LookVector
+            forward = Vector3.new(look.X, 0, look.Z)
+        end
+        if forward.Magnitude < 0.01 then
+            forward = Vector3.new(0, 0, -1)
+        else
+            forward = forward.Unit
+        end
+
+        root.AssemblyLinearVelocity = Vector3.new(forward.X * speed, 0, forward.Z * speed)
+        flight.ControlledRoot = root
+        return true
+    end
+
+    -- Raycast do voo: ignora o personagem e NPCs (incluindo o alvo), mas retorna
+    -- paredes/peças físicas à frente. Mantém o detector independente do movimento a pé.
+    local function raycastFlightObstacle(root, origin, direction, distance)
+        if not (root and root.Parent) or direction.Magnitude < 0.01 then return nil end
+        local exclusions = {}
+        local character = player.Character
+        if character then table.insert(exclusions, character) end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = exclusions
+        params.IgnoreWater = true
+        pcall(function() params.RespectCanCollide = true end)
+
+        for _ = 1, 12 do
+            local result = workspace:Raycast(origin, direction.Unit * distance, params)
+            if not result then return nil end
+
+            local ancestor = result.Instance
+            local humanoidModel = nil
+            while ancestor and ancestor ~= workspace do
+                if ancestor:IsA("Model") and ancestor:FindFirstChildOfClass("Humanoid") then
+                    humanoidModel = ancestor
+                    break
+                end
+                ancestor = ancestor.Parent
+            end
+
+            if humanoidModel then
+                table.insert(exclusions, humanoidModel)
+                params.FilterDescendantsInstances = exclusions
+            else
+                return result
+            end
+        end
+        return nil
+    end
+
+    local function flightObstacleAhead(root, forward)
+        if forward.Magnitude < 0.01 then return false end
+        local side = Vector3.new(-forward.Z, 0, forward.X)
+        local verticalOffsets = {-0.35, 0.35, 0.95}
+        local lateralOffsets = {-0.45, 0, 0.45}
+        for _, y in ipairs(verticalOffsets) do
+            for _, lateral in ipairs(lateralOffsets) do
+                local origin = root.Position + Vector3.new(0, y, 0) + side * lateral
+                if raycastFlightObstacle(root, origin, forward, flight.ObstacleRayDistance) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function chooseFlightSidestep(root, forward)
+        local side = Vector3.new(-forward.Z, 0, forward.X)
+        if side.Magnitude < 0.01 then
+            local look = root.CFrame.LookVector
+            forward = Vector3.new(look.X, 0, look.Z)
+            if forward.Magnitude < 0.01 then forward = Vector3.new(0, 0, -1) end
+            forward = forward.Unit
+            side = Vector3.new(-forward.Z, 0, forward.X)
+        else
+            side = side.Unit
+        end
+
+        local origin = root.Position + Vector3.new(0, 0.35, 0)
+        local leftBlocked = raycastFlightObstacle(root, origin, -side, flight.ObstacleSideProbeDistance) ~= nil
+        local rightBlocked = raycastFlightObstacle(root, origin, side, flight.ObstacleSideProbeDistance) ~= nil
+
+        -- Prefere o lado livre; se os dois lados parecerem livres/bloqueados, alterna
+        -- a direção entre tentativas para não insistir sempre no mesmo lado.
+        if leftBlocked and not rightBlocked then
+            return side
+        elseif rightBlocked and not leftBlocked then
+            return -side
+        end
+        flight.ObstacleSideSign = -(flight.ObstacleSideSign or 1)
+        return side * flight.ObstacleSideSign
+    end
+
+    local function ensureFlightController()
+        if flight.HeartbeatConnection then return end
+        flight.HeartbeatConnection = RunService.Heartbeat:Connect(function()
+            if not (AutoMob.Enabled and AutoMob.BypassVoo) then
+                pauseFlightMotion()
+                return
+            end
+
+            local target = flight.Target
+            if not (target and mobAlive(target)) then
+                pauseFlightMotion()
+                return
+            end
+
+            local char, hum, root = getChar()
+            local targetRoot = modelRoot(target)
+            if not (char and hum and root and targetRoot and targetRoot.Parent) then
+                pauseFlightMotion()
+                return
+            end
+
+            local speed = math.clamp(tonumber(AutoMob.FlightSpeed) or 100, 10, 200)
+            local toleranceY = flight.VerticalTolerance
+            local stage = flight.Stage
+            local now = os.clock()
+
+            -- Enquanto desvia, a velocidade é estritamente lateral: sem avanço e sem
+            -- subida/descida durante 0,5 segundo. Depois, retoma a etapa que estava ativa.
+            if stage == "DesviandoObstaculo" then
+                if now < (flight.ObstacleSidestepUntil or 0)
+                    and flight.ObstacleSidestepDirection then
+                    local sideDirection = flight.ObstacleSidestepDirection
+                    root.AssemblyLinearVelocity = Vector3.new(
+                        sideDirection.X * speed, 0, sideDirection.Z * speed)
+                    flight.ControlledRoot = root
+                    return
+                end
+
+                stage = flight.ObstacleSidestepReturnStage or "DeslocandoHorizontalmente"
+                flight.Stage = stage
+                flight.ObstacleSidestepDirection = nil
+                flight.ObstacleSidestepReturnStage = nil
+                flight.NextObstacleCheckAt = now + flight.ObstacleSidestepCooldown
+            end
+
+            -- Recuperação temporária de avanço quando a altitude não progride; é distinta
+            -- do desvio lateral acionado por uma parede à frente.
+            if stage == "RecuperandoFrente" then
+                if now < (flight.RecoveryUntil or 0) then
+                    local forward = Vector3.new(
+                        targetRoot.Position.X - root.Position.X,
+                        0,
+                        targetRoot.Position.Z - root.Position.Z
+                    )
+                    if forward.Magnitude < 0.1 then
+                        local look = root.CFrame.LookVector
+                        forward = Vector3.new(look.X, 0, look.Z)
+                    end
+                    if forward.Magnitude < 0.01 then
+                        forward = Vector3.new(0, 0, -1)
+                    else
+                        forward = forward.Unit
+                    end
+                    root.AssemblyLinearVelocity = Vector3.new(forward.X * speed, 0, forward.Z * speed)
+                    flight.ControlledRoot = root
+                    return
+                end
+
+                stage = flight.RecoveryReturnStage or "Subindo"
+                flight.Stage = stage
+                flight.RecoveryReturnStage = nil
+                flight.StallCheckStage = nil
+                flight.StallAnchorY = nil
+                flight.StallProgressAt = nil
+            end
+
+            if stage == "Subindo" then
+                -- Não existe mais altura fixa de 500 studs. O destino vertical é
+                -- o Y atual do NPC: sobe se ele estiver acima e desce se estiver abaixo.
+                local altitudeY = targetRoot.Position.Y
+                flight.AltitudeY = altitudeY
+
+                local verticalDelta = altitudeY - root.Position.Y
+                if flight.CheckVerticalStall("Subindo", math.abs(verticalDelta) > toleranceY,
+                    root, targetRoot, speed) then
+                    return
+                end
+                if math.abs(verticalDelta) <= toleranceY then
+                    flight.Stage = "DeslocandoHorizontalmente"
+                    root.AssemblyLinearVelocity = Vector3.zero
+                else
+                    local commandedSpeed = math.min(speed, math.max(1, math.abs(verticalDelta) * 4))
+                    root.AssemblyLinearVelocity = Vector3.new(0, (verticalDelta >= 0 and 1 or -1) * commandedSpeed, 0)
+                end
+                flight.ControlledRoot = root
+                return
+            end
+
+            if stage == "DeslocandoHorizontalmente" then
+                flight.CheckVerticalStall("DeslocandoHorizontalmente", false, root, targetRoot, speed)
+                -- Acompanha também mudanças de altura do NPC durante o percurso.
+                local altitudeY = targetRoot.Position.Y
+                flight.AltitudeY = altitudeY
+
+                local delta = Vector3.new(
+                    targetRoot.Position.X - root.Position.X,
+                    0,
+                    targetRoot.Position.Z - root.Position.Z
+                )
+                local horizontalDistance = delta.Magnitude
+                local verticalError = altitudeY - root.Position.Y
+
+                if math.abs(verticalError) > toleranceY * 2 then
+                    -- Corrige a altitude primeiro, mantendo a etapa horizontal sem
+                    -- começar a descida prematuramente.
+                    flight.Stage = "Subindo"
+                    root.AssemblyLinearVelocity = Vector3.new(0,
+                        (verticalError >= 0 and 1 or -1) * math.min(speed, math.max(1, math.abs(verticalError) * 4)), 0)
+                    flight.ControlledRoot = root
+                    return
+                end
+
+                -- Se houver peça física na direção do alvo, desvia somente para um
+                -- dos lados por 0,5 segundo, sem componente de velocidade para frente.
+                if now >= (flight.NextObstacleCheckAt or 0) and horizontalDistance > flight.HorizontalTolerance then
+                    flight.NextObstacleCheckAt = now + flight.ObstacleCheckInterval
+                    if flightObstacleAhead(root, delta.Unit) then
+                        flight.ObstacleSidestepDirection = chooseFlightSidestep(root, delta.Unit)
+                        flight.ObstacleSidestepReturnStage = "DeslocandoHorizontalmente"
+                        flight.ObstacleSidestepUntil = now + flight.ObstacleSidestepDuration
+                        flight.Stage = "DesviandoObstaculo"
+                        local sideDirection = flight.ObstacleSidestepDirection
+                        root.AssemblyLinearVelocity = Vector3.new(
+                            sideDirection.X * speed, 0, sideDirection.Z * speed)
+                        flight.ControlledRoot = root
+                        return
+                    end
+                end
+
+                if horizontalDistance <= flight.HorizontalTolerance then
+                    flight.Stage = "Descendo"
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    flight.ControlledRoot = root
+                    return
+                end
+
+                local horizontalSpeed = math.min(speed, math.max(1, horizontalDistance * 5))
+                local verticalSpeed = math.clamp(verticalError * 4, -speed * 0.25, speed * 0.25)
+                local horizontalVelocity = delta.Unit * horizontalSpeed
+                root.AssemblyLinearVelocity = Vector3.new(horizontalVelocity.X, verticalSpeed, horizontalVelocity.Z)
+                flight.ControlledRoot = root
+                return
+            end
+
+            if stage == "Descendo" then
+                local deltaXZ = Vector3.new(
+                    targetRoot.Position.X - root.Position.X,
+                    0,
+                    targetRoot.Position.Z - root.Position.Z
+                )
+                local horizontalDistance = deltaXZ.Magnitude
+
+                -- Se o NPC escapar lateralmente durante a descida, volte a subir
+                -- à altitude segura e só então corrija o alinhamento horizontal.
+                if horizontalDistance > flight.HorizontalTolerance * 1.5 then
+                    flight.Stage = "Subindo"
+                    local verticalToAltitude = flight.AltitudeY - root.Position.Y
+                    root.AssemblyLinearVelocity = Vector3.new(0,
+                        (verticalToAltitude >= 0 and 1 or -1)
+                            * math.min(speed, math.max(1, math.abs(verticalToAltitude) * 4)), 0)
+                    flight.ControlledRoot = root
+                    return
+                end
+
+                -- Faz a aproximação vertical considerando o erro horizontal, de modo
+                -- que a distância 3D final não ultrapasse a faixa de aproximação.
+                local allowedVertical = math.sqrt(math.max(0.25,
+                    flight.TargetReach * flight.TargetReach - horizontalDistance * horizontalDistance))
+                local desiredY = targetRoot.Position.Y + allowedVertical
+                local verticalDelta = desiredY - root.Position.Y
+
+                if flight.CheckVerticalStall("Descendo", verticalDelta < -0.1,
+                    root, targetRoot, speed) then
+                    return
+                end
+                if verticalDelta >= -0.1 then
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    flight.ControlledRoot = root
+                    return
+                end
+
+                local descendSpeed = math.min(speed, math.max(1, math.abs(verticalDelta) * 4))
+                root.AssemblyLinearVelocity = Vector3.new(0, -descendSpeed, 0)
+                flight.ControlledRoot = root
+                return
+            end
+
+            root.AssemblyLinearVelocity = Vector3.zero
+            flight.ControlledRoot = root
+        end)
+    end
+
+    local function ensureFlightMode(token)
+        -- Enquanto o personagem renasce, aguarda a rotina dedicada enviar H uma única vez.
+        if flight.RespawnReactivating then return false end
+        -- A vassoura/voo acionado por H só pode ser ativado durante o Auto Farm ativo.
+        -- O toggle Bypass Voo sozinho não envia H com o Auto Farm desligado.
+        if not (AutoMob.Enabled and AutoMob.BypassVoo and isActive(token)) then
+            return false
+        end
+        local char, hum, root = getChar()
+        if not (char and hum and root) then return false end
+
+        if flight.Character ~= char then
+            flight.Character = char
+            flight.ModeRequested = false
+            flight.ModeOwned = false
+            pauseFlightMotion()
+        end
+        if flight.ModeRequested then return true end
+
+        setMoving(false)
+        sendMoveKey(Enum.KeyCode.W, false)
+        sendMoveKey(Enum.KeyCode.LeftShift, false)
+        sendMoveKey(Enum.KeyCode.Space, false)
+
+        -- Se o jogo já sinaliza voo ativo, não alterna H para evitar desligá-lo.
+        if hasFlightIndicator(char, hum, root) then
+            flight.ModeRequested = true
+            flight.ModeOwned = false
+            return true
+        end
+
+        if not tapFlightToggle() then
+            setStatus("não foi possível enviar a tecla H", true)
+            return false
+        end
+        flight.ModeRequested = true
+        flight.ModeOwned = true
+
+        -- Aguarda o jogo processar H. Alguns jogos não expõem um indicador público;
+        -- nesses casos, usa a janela de assentamento sem repetir H.
+        local deadline = os.clock() + 0.45
+        while isActive(token) and AutoMob.BypassVoo and os.clock() < deadline do
+            local currentChar, currentHum, currentRoot = getChar()
+            if currentChar and currentChar == char and currentHum and currentRoot
+                and hasFlightIndicator(currentChar, currentHum, currentRoot) then
+                break
+            end
+            task.wait(0.03)
+        end
+        return isActive(token) and AutoMob.BypassVoo
+    end
+
+    local function setFlightTarget(mob, reach, token)
+        local isNewTarget = flight.Target ~= mob
+        if isNewTarget then
+            -- Um novo NPC ganha uma rota aérea própria, mesmo que o alvo anterior
+            -- já tivesse passado para a locomoção normal na faixa de 50 studs.
+            flight.NormalHandoffTarget = nil
+            pauseFlightMotion()
+        end
+        if not ensureFlightMode(token) then return false end
+
+        if isNewTarget or flight.Stage == "Parado" or not flight.AltitudeY then
+            local char, hum, root = getChar()
+            local targetRoot = modelRoot(mob)
+            if not (char and hum and root and targetRoot and targetRoot.Parent) then return false end
+            -- Define o Y inicial pela altura do alvo. A diferença assinada determina
+            -- se o personagem sobe ou desce, em vez de percorrer uma altura fixa.
+            flight.GroundY = nil
+            flight.AltitudeY = targetRoot.Position.Y
+            flight.Stage = "Subindo"
+        end
+
+        flight.Target = mob
+        flight.TargetReach = math.max(1, reach)
+        ensureFlightController()
+        return true
+    end
+
+    stopFlightMode = function(disableGameFlight, forceToggleFlight)
+        if flight.HeartbeatConnection then
+            pcall(function() flight.HeartbeatConnection:Disconnect() end)
+            flight.HeartbeatConnection = nil
+        end
+        pauseFlightMotion()
+        setMoving(false)
+        sendMoveKey(Enum.KeyCode.W, false)
+        sendMoveKey(Enum.KeyCode.LeftShift, false)
+        sendMoveKey(Enum.KeyCode.S, false)
+        sendMoveKey(Enum.KeyCode.Space, false)
+        sendMoveKey(Enum.KeyCode.H, false)
+
+        if disableGameFlight and flight.ModeRequested and (flight.ModeOwned or forceToggleFlight) then
+            local _, _, root = getChar()
+            if root then tapFlightToggle() end
+        end
+        flight.ModeRequested = false
+        flight.ModeOwned = false
+        flight.Character = nil
+    end
+
+    -- Detecta morte e respawn enquanto o Auto Farm + Bypass Voo estão ativos.
+    -- No respawn, espera o novo personagem ficar pronto e envia H somente uma vez;
+    -- isso evita que a rotina normal do alvo envie um segundo H em seguida.
+    local function setupRespawnListeners()
+        if AutoMob.CharacterAddedConnection then
+            pcall(function() AutoMob.CharacterAddedConnection:Disconnect() end)
+            AutoMob.CharacterAddedConnection = nil
+        end
+        if AutoMob.DeathConnection then
+            pcall(function() AutoMob.DeathConnection:Disconnect() end)
+            AutoMob.DeathConnection = nil
+        end
+
+        AutoMob.RespawnPending = false
+        flight.RespawnReactivating = false
+
+        local function attachDeathListener(char)
+            if AutoMob.DeathConnection then
+                pcall(function() AutoMob.DeathConnection:Disconnect() end)
+                AutoMob.DeathConnection = nil
+            end
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if not hum then return end
+
+            AutoMob.DeathConnection = hum.Died:Connect(function()
+                if not (AutoMob.Enabled and AutoMob.BypassVoo) then return end
+                AutoMob.RespawnPending = true
+                flight.RespawnReactivating = true
+                -- Não alterna H na morte: o novo personagem ainda não existe.
+                stopFlightMode(false)
+                flight.RespawnReactivating = true
+                flight.NormalHandoffTarget = nil
+                flight.CompletedTarget = nil
+                setMoving(false)
+                sendMoveKey(Enum.KeyCode.W, false)
+                sendMoveKey(Enum.KeyCode.LeftShift, false)
+                sendMoveKey(Enum.KeyCode.S, false)
+                sendMoveKey(Enum.KeyCode.Space, false)
+                setStatus("morte detectada; aguardando respawn para reativar o voo", true)
+            end)
+        end
+
+        AutoMob.CharacterAddedConnection = player.CharacterAdded:Connect(function(char)
+            attachDeathListener(char)
+            if not (AutoMob.Enabled and AutoMob.BypassVoo) then
+                return
+            end
+
+            -- CharacterAdded é a confirmação do respawn, inclusive se a morte
+            -- ocorreu antes de o detector de Humanoid.Died ficar conectado.
+            AutoMob.RespawnPending = true
+            flight.RespawnReactivating = true
+            task.spawn(function()
+                local hum = char:WaitForChild("Humanoid", 10)
+                local root = char:WaitForChild("HumanoidRootPart", 10)
+                if not (hum and root) then
+                    if player.Character == char then flight.RespawnReactivating = false end
+                    return
+                end
+
+                -- Dá ao jogo um instante para terminar a criação do personagem.
+                task.wait(0.35)
+                if not (AutoMob.Enabled and AutoMob.BypassVoo and AutoMob.RespawnPending
+                    and player.Character == char and hum.Health > 0) then
+                    if player.Character == char then flight.RespawnReactivating = false end
+                    return
+                end
+
+                local alreadyFlying = hasFlightIndicator(char, hum, root)
+                local sent = alreadyFlying
+                if not alreadyFlying then
+                    sent = tapFlightToggle()
+                end
+
+                if player.Character ~= char or not AutoMob.Enabled or not AutoMob.BypassVoo then
+                    flight.RespawnReactivating = false
+                    return
+                end
+
+                -- Marca o modo como tratado para que ensureFlightMode não alterne H
+                -- de novo; se o envio falhar, o caminho normal poderá tentar ativar.
+                flight.Character = char
+                flight.ModeRequested = sent == true
+                flight.ModeOwned = sent == true and not alreadyFlying
+                flight.Target = nil
+                flight.Stage = "Parado"
+                flight.GroundY = nil
+                flight.AltitudeY = nil
+                flight.NormalHandoffTarget = nil
+                flight.CompletedTarget = nil
+                AutoMob.RespawnPending = false
+                flight.RespawnReactivating = false
+
+                if sent then
+                    setStatus("respawn detectado; H reativado, retomando o Auto Farm", true)
+                else
+                    setStatus("respawn detectado; o voo será reativado pela rotina do Auto Farm", true)
+                end
+            end)
+        end)
+
+        attachDeathListener(player.Character)
+    end
+
+    AutoMob.SetBypassVoo = function(enabled)
+        local previous = AutoMob.BypassVoo == true
+        AutoMob.BypassVoo = enabled == true
+        if previous ~= AutoMob.BypassVoo then
+            -- Alternar o método deve armar uma rota nova para o alvo atual, se houver.
+            flight.CompletedTarget = nil
+            flight.NormalHandoffTarget = nil
+        end
+        HUB_SETTINGS.BypassVoo = AutoMob.BypassVoo
+        saveHubSettings()
+        if not AutoMob.BypassVoo then
+            AutoMob.RespawnPending = false
+            flight.RespawnReactivating = false
+            stopFlightMode(true)
+        end
+    end
+
+    AutoMob.SetFlightSpeed = function(value, saveNow)
+        AutoMob.FlightSpeed = math.clamp(math.floor((tonumber(value) or 100) + 0.5), 10, 200)
+        HUB_SETTINGS.FlightSpeed = AutoMob.FlightSpeed
+        if saveNow then saveHubSettings() end
+        return AutoMob.FlightSpeed
     end
 
     -- Registra quando o obstáculo saiu da frente, mas permite repetir a recuperação
@@ -1342,6 +2126,20 @@ do
         local _, _, root0 = getChar()
         local startDist = (root0 and mr0) and (root0.Position - mr0.Position).Magnitude or 0
         local nearLimit = math.max(MOB_CFG.MobTimeout, startDist / 8)
+        if AutoMob.BypassVoo then
+            local targetRootForBudget = modelRoot(mob)
+            local horizontalBudget, verticalBudget = 0, 0
+            if root0 and targetRootForBudget then
+                local delta = targetRootForBudget.Position - root0.Position
+                horizontalBudget = Vector3.new(delta.X, 0, delta.Z).Magnitude
+                verticalBudget = math.abs(delta.Y)
+            end
+            local speedForBudget = math.max(10, math.clamp(tonumber(AutoMob.FlightSpeed) or 100, 10, 200))
+            -- Orçamento calculado pela distância real até o alvo, incluindo diferenças
+            -- positivas e negativas de altura, sem presumir subida fixa de 500 studs.
+            local flightBudget = (verticalBudget + horizontalBudget) / speedForBudget + 20
+            nearLimit = math.max(nearLimit, flightBudget)
+        end
 
         local lastNear = t0            
         local progressAt = t0          
@@ -1391,61 +2189,113 @@ do
                 local dist = (root.Position - mr.Position).Magnitude
                 steerPart = mr
 
+                -- Ao chegar a 50 studs do NPC selecionado, termina o trecho aéreo
+                -- e entrega a aproximação final ao método normal já integrado ao Auto Farm.
+                -- Isso também evita manter o voo ativo durante o combate próximo.
+                if AutoMob.BypassVoo and flight.NormalHandoffTarget ~= mob
+                    and dist <= flight.FlightHandoffDistance then
+                    flight.NormalHandoffTarget = mob
+                    stopFlightMode(true, true)
+                    setStatus("a menos de 50 studs: retomando locomoção normal", true)
+                end
+
+                local useFlightForTarget = AutoMob.BypassVoo and flight.NormalHandoffTarget ~= mob
+
+                -- Se o bypass for ligado durante combate ou o personagem já estiver
+                -- perto do NPC no início, faça a rota aérea antes de considerar o alvo
+                -- engajado, exceto quando já foi entregue à locomoção normal a 50 studs.
+                if useFlightForTarget and engaged
+                    and flight.CompletedTarget ~= mob and flight.Target ~= mob then
+                    engaged = false
+                end
+
                 if engaged then
                     if dist > reach + MOB_CFG.StopBuffer then
                         engaged = false
                         bestDist, progressAt = dist, now
                     end
                 elseif dist <= reach then
-                    engaged = true
+                    if not useFlightForTarget or flight.CompletedTarget == mob
+                        or (flight.Target == mob and flight.Stage == "Descendo") then
+                        engaged = true
+                    end
                 end
 
                 if engaged then
+                    if useFlightForTarget and flight.Target == mob and flight.Stage == "Descendo" then
+                        flight.CompletedTarget = mob
+                    end
                     setMoving(false)
+                    if useFlightForTarget and (flight.ModeRequested or flight.HeartbeatConnection) then
+                        -- Nesta transição a especificação exige encerrar o voo antes
+                        -- de entregar o controle ao combate, inclusive se ele já estava ativo.
+                        stopFlightMode(true, true)
+                    else
+                        pauseFlightMotion()
+                    end
                     setStatus(string.format("perto de %s (%d studs)", mob.Name, math.floor(dist)))
                     hum:MoveTo(root.Position)
                     faceTo(root, mr.Position)
                     lastNear, progressAt, bestDist = now, now, dist
                 else
-                    local recoveredFromObstacle = false
-                    if MOB_CFG.ObstacleRecoveryEnabled then
-                        local obstacleHit = detectFrontObstacle(root)
-                        if obstacleHit then
-                            obstacleClearSince = nil
-                            -- Se o mesmo obstáculo continuar à frente, repete a sequência
-                            -- após o cooldown em vez de bloquear novas tentativas pelo latch.
-                            if now - lastObstacleRecoveryAt >= MOB_CFG.ObstacleRecoveryCooldown then
-                                obstacleLatched = true
-                                setStatus("obstáculo à frente: recuando e pulando", true)
-                                recoveredFromObstacle = performObstacleRecovery(hum, root, token)
-                                -- O intervalo de segurança começa ao terminar a sequência.
-                                lastObstacleRecoveryAt = os.clock()
+                    if useFlightForTarget then
+                        -- O voo substitui caminhada e recuperação de obstáculos; nenhum
+                        -- W/Shift é mantido em paralelo com o controlador de velocidade.
+                        setMoving(false)
+                        sendMoveKey(Enum.KeyCode.W, false)
+                        sendMoveKey(Enum.KeyCode.LeftShift, false)
+                        sendMoveKey(Enum.KeyCode.Space, false)
+                        if setFlightTarget(mob, reach, token) then
+                            setStatus(string.format("%s até %s (%d studs, vel. %d)",
+                                flight.Stage, mob.Name, math.floor(dist), AutoMob.FlightSpeed))
+                        else
+                            setStatus("ativando voo...", true)
+                        end
+                    else
+                        -- Ao voltar ao método original, encerra a sessão de voo apenas
+                        -- se ela foi iniciada pelo Bypass Voo e libera seus inputs.
+                        if flight.ModeRequested or flight.HeartbeatConnection then
+                            stopFlightMode(true)
+                        end
 
-                                if recoveredFromObstacle and isActive(token) and mr.Parent then
-                                    dist = (root.Position - mr.Position).Magnitude
-                                    now = os.clock()
-                                    bestDist = dist
-                                    progressAt = now
-                                    lastNear = now
+                        local recoveredFromObstacle = false
+                        if MOB_CFG.ObstacleRecoveryEnabled then
+                            local obstacleHit = detectFrontObstacle(root)
+                            if obstacleHit then
+                                obstacleClearSince = nil
+                                -- Se o mesmo obstáculo continuar à frente, repete a sequência
+                                -- após o cooldown em vez de bloquear novas tentativas pelo latch.
+                                if now - lastObstacleRecoveryAt >= MOB_CFG.ObstacleRecoveryCooldown then
+                                    obstacleLatched = true
+                                    setStatus("obstáculo à frente: recuando e pulando", true)
+                                    recoveredFromObstacle = performObstacleRecovery(hum, root, token)
+                                    -- O intervalo de segurança começa ao terminar a sequência.
+                                    lastObstacleRecoveryAt = os.clock()
+
+                                    if recoveredFromObstacle and isActive(token) and mr.Parent then
+                                        dist = (root.Position - mr.Position).Magnitude
+                                        now = os.clock()
+                                        bestDist = dist
+                                        progressAt = now
+                                        lastNear = now
+                                    end
+                                end
+                            elseif obstacleLatched then
+                                if not obstacleClearSince then
+                                    obstacleClearSince = now
+                                elseif now - obstacleClearSince >= MOB_CFG.ObstacleClearResetDelay then
+                                    obstacleLatched = false
+                                    obstacleClearSince = nil
                                 end
                             end
-                        elseif obstacleLatched then
-                            if not obstacleClearSince then
-                                obstacleClearSince = now
-                            elseif now - obstacleClearSince >= MOB_CFG.ObstacleClearResetDelay then
-                                obstacleLatched = false
-                                obstacleClearSince = nil
-                            end
                         end
-                    end
 
-                    if isActive(token) then
-                        setMoving(true)
-                        setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
+                        if isActive(token) then
+                            setMoving(true)
+                            setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
+                        end
+                        -- O método original mantém W + Shift e não usa MoveTo no destino.
                     end
-                    -- O deslocamento até o alvo é feito pelo controle normal do jogo:
-                    -- W fica pressionado e Shift é acionado após 0,35 segundo.
-                    -- Não chamar MoveTo(mr.Position) aqui evita competir com o input de corrida.
 
                     if dist < bestDist - 1.5 then
                         bestDist, progressAt = dist, now
@@ -1454,8 +2304,12 @@ do
                         lastNear, progressAt = now, now
                     end
 
-                    if now - progressAt > MOB_CFG.GiveUpTime
-                        or now - lastNear > nearLimit then
+                    -- O temporizador curto original foi feito para caminhada. A rota
+                    -- aérea pode aumentar a distância durante a subida; nesse modo,
+                    -- use o orçamento calculado para subida + horizontal + descida.
+                    local flightTimedOut = useFlightForTarget and (now - lastNear > nearLimit)
+                    local walkTimedOut = not useFlightForTarget and now - progressAt > MOB_CFG.GiveUpTime
+                    if flightTimedOut or walkTimedOut or (not useFlightForTarget and now - lastNear > nearLimit) then
                         reason = "inalcancavel"
                         break
                     end
@@ -1473,6 +2327,11 @@ do
         local _, _, root = getChar()
         if not root then
             setMoving(false)
+            if flight.ModeRequested or flight.HeartbeatConnection then
+                stopFlightMode(true)
+            else
+                pauseFlightMotion()
+            end
             steerPart = nil
             AutoMob.Target = nil
             setStatus("sem personagem")
@@ -1483,6 +2342,11 @@ do
         local selected = hasSelection()
         if not selected and not MOB_CFG.AnyWhenNoSelection then
             setMoving(false)
+            if flight.ModeRequested or flight.HeartbeatConnection then
+                stopFlightMode(true)
+            else
+                pauseFlightMotion()
+            end
             steerPart = nil
             AutoMob.Target = nil
             setStatus("marque um tipo de mob na lista")
@@ -1493,6 +2357,11 @@ do
         local mob = findMob(root)
         if not mob then
             setMoving(false)
+            if flight.ModeRequested or flight.HeartbeatConnection then
+                stopFlightMode(true)
+            else
+                pauseFlightMotion()
+            end
             steerPart = nil
             AutoMob.Target = nil
             if selected then
@@ -1507,6 +2376,14 @@ do
         AutoMob.Target = mob
         local reason = chase(mob, token)
         AutoMob.Target = nil
+        if flight.NormalHandoffTarget == mob then
+            flight.NormalHandoffTarget = nil
+        end
+        if AutoMob.BypassVoo and (flight.ModeRequested or flight.HeartbeatConnection) then
+            stopFlightMode(true)
+        else
+            pauseFlightMotion()
+        end
 
         if reason == "inalcancavel" or reason == "sem-raiz" then
             ignored[mob] = os.clock() + MOB_CFG.IgnoreTime
@@ -1517,6 +2394,8 @@ do
     local function startAutoMob()
         if AutoMob.Enabled then return end
         AutoMob.Enabled = true
+        setupRespawnListeners()
+        flight.CompletedTarget = nil
         AutoMob.Token = AutoMob.Token + 1
         local token = AutoMob.Token
 
@@ -1525,6 +2404,9 @@ do
             AutoMob.Thread = nil
         end
 
+        if flight.ModeRequested or flight.HeartbeatConnection then
+            stopFlightMode(true)
+        end
         obstacleLatched = false
         obstacleClearSince = nil
         lastObstacleRecoveryAt = -math.huge
@@ -1541,6 +2423,7 @@ do
                 local ok, err = pcall(step, token)
                 if not ok then
                     warn("[RAMDOM HUB] Auto Farm erro: " .. tostring(err))
+                    stopFlightMode(true)
                     setMoving(false)
                     sendMoveKey(Enum.KeyCode.S, false)
                     sendMoveKey(Enum.KeyCode.Space, false)
@@ -1556,8 +2439,33 @@ do
     end
 
     local function stopAutoMob()
-        if not AutoMob.Enabled then return end
+        if not AutoMob.Enabled then
+            AutoMob.RespawnPending = false
+            flight.RespawnReactivating = false
+            if AutoMob.CharacterAddedConnection then
+                pcall(function() AutoMob.CharacterAddedConnection:Disconnect() end)
+                AutoMob.CharacterAddedConnection = nil
+            end
+            if AutoMob.DeathConnection then
+                pcall(function() AutoMob.DeathConnection:Disconnect() end)
+                AutoMob.DeathConnection = nil
+            end
+            if flight.ModeRequested or flight.HeartbeatConnection then
+                stopFlightMode(true)
+            end
+            return
+        end
         AutoMob.Enabled = false
+        AutoMob.RespawnPending = false
+        flight.RespawnReactivating = false
+        if AutoMob.CharacterAddedConnection then
+            pcall(function() AutoMob.CharacterAddedConnection:Disconnect() end)
+            AutoMob.CharacterAddedConnection = nil
+        end
+        if AutoMob.DeathConnection then
+            pcall(function() AutoMob.DeathConnection:Disconnect() end)
+            AutoMob.DeathConnection = nil
+        end
         AutoMob.Token = AutoMob.Token + 1
 
         if AutoMob.Thread then
@@ -1567,6 +2475,7 @@ do
 
         AutoMob.Target = nil
         steerPart = nil
+        stopFlightMode(true)
         setMoving(false)
         -- Libera também teclas temporárias usadas durante a recuperação.
         sendMoveKey(Enum.KeyCode.S, false)
@@ -5306,8 +6215,10 @@ local FISH_CFG = {
     HubScanInterval = 0.15,
     HubRescanInterval = 0.55,
     CastRetryDelay = 6.0,
-    -- Após a confirmação de captura, relança rapidamente.
-    PostCatchCastDelay = 0.05,
+    -- Após o desaparecimento do minijogo, aguarda a notificação real de captura.
+    -- Só então reinicia o toggle e aguarda 0,75 s antes de ligar novamente.
+    PostCatchToggleDelay = 0.75,
+    CatchNotificationTimeout = 8.0,
     PostCatchQuietTime = 0.02,
     HubLossGraceInterval = 0.03,
     -- Confirma o desaparecimento com uma janela curta, evitando relançar em uma
@@ -5350,6 +6261,27 @@ do
     local inputResyncConnection = nil
     local statusLastWarn = ""
     local isActive
+    local catchRestartPending = false
+
+    -- Depois que o minijogo desaparece e a notificação de captura é detectada,
+    -- alterna o toggle real do Auto Fish: OFF agora e ON depois de 0,75 s.
+    -- O atraso é agendado antes de desligar, pois Stop pode cancelar a thread atual.
+    local function cycleAutoFishingToggleAfterCatch()
+        if catchRestartPending then return end
+        if not (setAutoFishing and getAutoFishing and getAutoFishing()) then return end
+
+        catchRestartPending = true
+        task.delay(FISH_CFG.PostCatchToggleDelay, function()
+            catchRestartPending = false
+            -- Não reativa o recurso se o script/UI inteiro foi encerrado durante a pausa.
+            if not ScreenGui or not ScreenGui.Parent then return end
+            if setAutoFishing and getAutoFishing and not getAutoFishing() then
+                setAutoFishing(true)
+            end
+        end)
+
+        setAutoFishing(false)
+    end
 
     local function markSyntheticPointerInput()
         -- Evita confundir os próprios eventos do Auto Fish com clique/toque do jogador.
@@ -5406,6 +6338,12 @@ do
     local candidateGuiObjects = setmetatable({}, {__mode = "k"})
     local trackedRoots = setmetatable({}, {__mode = "k"})
     local trackingConnections = {}
+    -- Rastreamento leve de labels para reconhecer a notificação real de captura.
+    local notificationTrackedRoots = setmetatable({}, {__mode = "k"})
+    local notificationTrackedText = setmetatable({}, {__mode = "k"})
+    local notificationActiveText = setmetatable({}, {__mode = "k"})
+    local notificationLastText = setmetatable({}, {__mode = "k"})
+    local catchNotificationSequence = 0
 
     isActive = function(token)
         return AutoFishing.Enabled and AutoFishing.Token == token
@@ -5454,6 +6392,56 @@ do
             end
         end)
         return string.lower(table.concat(chunks, " "))
+    end
+
+    local function isCatchNotificationText(value)
+        local text = string.lower(tostring(value or ""))
+        return text:find("caught", 1, true) ~= nil
+            and text:find("added to supplies", 1, true) ~= nil
+    end
+
+    local function trackCatchNotificationText(obj)
+        if not obj or notificationTrackedText[obj] or isOurGui(obj) then return end
+        if not (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then return end
+        notificationTrackedText[obj] = true
+
+        local function inspectText()
+            if not obj.Parent or isOurGui(obj) then return end
+            local text = tostring(obj.Text or "")
+            if isCatchNotificationText(text) then
+                -- Conta notificações novas, inclusive quando o jogo reutiliza o mesmo label.
+                if not notificationActiveText[obj] or notificationLastText[obj] ~= text then
+                    catchNotificationSequence = catchNotificationSequence + 1
+                end
+                notificationActiveText[obj] = true
+                notificationLastText[obj] = text
+            else
+                notificationActiveText[obj] = nil
+                notificationLastText[obj] = nil
+            end
+        end
+
+        pcall(function()
+            obj:GetPropertyChangedSignal("Text"):Connect(inspectText)
+        end)
+        inspectText()
+    end
+
+    local function trackCatchNotificationRoot(root)
+        if not root or notificationTrackedRoots[root] then return end
+        notificationTrackedRoots[root] = true
+        pcall(function()
+            root.DescendantAdded:Connect(trackCatchNotificationText)
+        end)
+        -- Indexa os labels existentes uma vez; novos labels são vistos pelo evento acima.
+        task.spawn(function()
+            local ok, descendants = pcall(function() return root:GetDescendants() end)
+            if not ok or not descendants then return end
+            for index, obj in ipairs(descendants) do
+                if obj and obj.Parent then trackCatchNotificationText(obj) end
+                if index % 200 == 0 then task.wait() end
+            end
+        end)
     end
 
     local function colorIsYellow(c)
@@ -5608,8 +6596,15 @@ do
         if now < nextGuiTrackingCheck then return end
         nextGuiTrackingCheck = now + 3.0
         local playerGui = player:FindFirstChildOfClass("PlayerGui")
-        if playerGui then trackGuiRoot(playerGui) end
-        -- Só acompanha ScreenGuis do CoreGui com nome diretamente relacionado à pesca.
+        if playerGui then
+            trackGuiRoot(playerGui)
+            trackCatchNotificationRoot(playerGui)
+        end
+        -- A notificação de captura pode ficar em um ScreenGui de notificações genérico,
+        -- por isso observamos os textos do CoreGui além das interfaces de pesca.
+        trackCatchNotificationRoot(CoreGui)
+        -- Só acompanha ScreenGuis do CoreGui com nome diretamente relacionado à pesca
+        -- para a detecção do minijogo; o rastreador acima cuida das notificações.
         pcall(function()
             for _, child in ipairs(CoreGui:GetChildren()) do
                 if child:IsA("ScreenGui") and not isOurGui(child)
@@ -5998,6 +6993,9 @@ do
             local hubMissingSince = nil
             local hasSeenHubSinceCast = false
             local awaitingHubSince = nil
+            local hubCatchNotificationBaseline = catchNotificationSequence
+            local awaitingCatchNotificationUntil = nil
+            local catchNotificationBaseline = 0
             while isActive(token) do
                 local now = os.clock()
                 local inPostCatchQuiet = now < postCatchQuietUntil
@@ -6026,6 +7024,11 @@ do
                     local pairStillValid = isPairUsable(cachedPair)
                     nextHubScanAt = now + (pairStillValid and FISH_CFG.HubRescanInterval or FISH_CFG.HubScanInterval)
                     if cachedHubVisible then
+                        -- Ao entrar em cada minijogo, registra a sequência atual de notificações.
+                        -- Uma notificação anterior não pode confirmar a captura atual.
+                        if not hasSeenHubSinceCast then
+                            hubCatchNotificationBaseline = catchNotificationSequence
+                        end
                         -- Hub detectado: a vara já entrou no minijogo. Cancela qualquer
                         -- estado de espera do primeiro aparecimento e bloqueia novos casts.
                         hasSeenHubSinceCast = true
@@ -6038,17 +7041,36 @@ do
                         and hubMissingSince
                         and now - lastManualPointerAt >= FISH_CFG.ManualInputGraceTime
                         and now - hubMissingSince >= FISH_CFG.HubDisappearConfirmTime then
-                        -- Só considera a pesca encerrada após várias leituras sem hub.
-                        -- Isso evita que uma leitura perdida dispare um clique na água,
-                        -- que poderia fechar/interromper o minijogo que ainda está ativo.
+                        -- O minijogo realmente desapareceu. Ainda não reinicia o toggle:
+                        -- primeiro aguarda a notificação "Caught ... added to Supplies".
                         hasSeenHubSinceCast = false
                         awaitingHubSince = nil
                         cachedPair = nil
-                        lastCastAt = now - FISH_CFG.CastRetryDelay + FISH_CFG.PostCatchCastDelay
+                        lastCastAt = now -- impede um novo lançamento enquanto aguarda a notificação
                         postCatchQuietUntil = now + FISH_CFG.PostCatchQuietTime
                         hubMissingSince = nil
+                        catchNotificationBaseline = hubCatchNotificationBaseline
+                        awaitingCatchNotificationUntil = now + FISH_CFG.CatchNotificationTimeout
                     end
                 end
+
+                -- Só alterna o toggle depois que o minijogo sumiu E chegou uma notificação
+                -- nova de captura. A sequência também cobre notificações que chegaram
+                -- alguns instantes antes da confirmação do desaparecimento.
+                if awaitingCatchNotificationUntil then
+                    if catchNotificationSequence > catchNotificationBaseline then
+                        awaitingCatchNotificationUntil = nil
+                        lastCastAt = now
+                        postCatchQuietUntil = now + FISH_CFG.PostCatchQuietTime
+                        AutoFishing.Status = "captura confirmada pela notificação; reiniciando Auto Fish"
+                        cycleAutoFishingToggleAfterCatch()
+                    elseif now >= awaitingCatchNotificationUntil then
+                        -- Sem notificação não assumimos que houve captura; volta ao ciclo normal.
+                        awaitingCatchNotificationUntil = nil
+                        lastCastAt = now - FISH_CFG.CastRetryDelay + FISH_CFG.NoHubRetryDelay
+                    end
+                end
+
                 local pair, hubVisible = cachedPair, cachedHubVisible
 
                 if hubVisible then
@@ -6085,7 +7107,10 @@ do
                 else
                     sendMouseHeld(false)
                     AutoFishing.Status = "aguardando hub de pesca"
-                    if awaitingHubSince then
+                    if awaitingCatchNotificationUntil then
+                        -- Não relança a vara até a notificação confirmar a captura ou expirar.
+                        AutoFishing.Status = "minijogo desapareceu; aguardando notificação de captura"
+                    elseif awaitingHubSince then
                         -- Depois do lançamento, não clique na água de novo enquanto o
                         -- jogo ainda pode estar esperando a fisgada/abrindo o minijogo.
                         local waitForHub = now - awaitingHubSince
@@ -6699,7 +7724,7 @@ do
     end
 
     local function sendMoveKey(keyCode, down)
-        pcall(function()
+        return pcall(function()
             VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
         end)
     end
@@ -7447,8 +8472,8 @@ local Tabs = {}
 
 local function createPage(name)
     -- Raid has enough controls to overflow the viewport, so make this page scrollable.
-    local isScrollableRaid = name == "AutoRaid"
-    local page = Instance.new(isScrollableRaid and "ScrollingFrame" or "Frame")
+    local isScrollable = name == "AutoRaid" or name == "AutoMobs"
+    local page = Instance.new(isScrollable and "ScrollingFrame" or "Frame")
     page.Name = name
     page.Size = UDim2.new(1, 0, 1, 0)
     page.BackgroundTransparency = 1
@@ -7456,7 +8481,7 @@ local function createPage(name)
     page.ZIndex = 2
     page.Parent = ContentHolder
 
-    if isScrollableRaid then
+    if isScrollable then
         page.BorderSizePixel = 0
         page.Active = true
         page.ClipsDescendants = true
@@ -7474,7 +8499,7 @@ local function createPage(name)
     layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Parent = page
 
-    if isScrollableRaid then
+    if isScrollable then
         layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
             page.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 12)
         end)
@@ -7603,6 +8628,7 @@ end
 
 setTab("Home")
 
+do
 --// ==========================================
 --// ABA HOME (Changelog)
 --// ==========================================
@@ -7693,7 +8719,8 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 1, "v1.8", "+ Auto Fish Adicionado (Auto Itens)", 78)
+createUpdateCard(HomePage, 1, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
+end --// ABA HOME (Changelog)
 
 --// ==========================================
 --// ABA COMBAT
@@ -7979,7 +9006,7 @@ MobStatus.Font = Enum.Font.Gotham
 MobStatus.TextSize = 12
 MobStatus.TextXAlignment = Enum.TextXAlignment.Left
 MobStatus.TextTruncate = Enum.TextTruncate.AtEnd
-MobStatus.LayoutOrder = 2
+MobStatus.LayoutOrder = 4
 MobStatus.Parent = AutoMobsPage
 
 AutoMob.OnStatus = function(text)
@@ -7992,7 +9019,7 @@ do
     MobSelectCard.Size = UDim2.new(1, 0, 0, 250)
     MobSelectCard.BackgroundColor3 = Theme.Card
     MobSelectCard.BorderSizePixel = 0
-    MobSelectCard.LayoutOrder = 3
+    MobSelectCard.LayoutOrder = 5
     MobSelectCard.Parent = AutoMobsPage
     addCorner(MobSelectCard, 14)
     addStroke(MobSelectCard, Theme.Stroke, 1, 0.5)
@@ -8496,7 +9523,7 @@ end)
 
 local setAntiAFK, getAntiAFK = createToggleCard(
     ConfigScroll,
-    2,
+    3,
     "Anti-AFK",
     true,
     function(state)
@@ -8508,6 +9535,135 @@ local setAntiAFK, getAntiAFK = createToggleCard(
     end
 )
 startAntiAFK()
+
+do
+--// Bypass Voo + velocidade configurável (10 a 200 studs/s).
+local setBypassVooToggle, getBypassVooToggle = createToggleCard(
+    AutoMobsPage,
+    2,
+    "Bypass Voo",
+    AutoMob.BypassVoo,
+    function(state)
+        AutoMob.SetBypassVoo(state)
+    end
+)
+
+local BypassVooSpeedCard = Instance.new("Frame")
+BypassVooSpeedCard.Name = "BypassVooSpeedCard"
+BypassVooSpeedCard.Size = UDim2.new(1, 0, 0, 88)
+BypassVooSpeedCard.BackgroundColor3 = Theme.Card
+BypassVooSpeedCard.BorderSizePixel = 0
+BypassVooSpeedCard.LayoutOrder = 2
+BypassVooSpeedCard.Parent = ConfigScroll
+addCorner(BypassVooSpeedCard, 14)
+addStroke(BypassVooSpeedCard, Theme.Stroke, 1, 0.5)
+addGradient(BypassVooSpeedCard, Theme.CardHover, Theme.Card, 90)
+
+local BypassVooSpeedTitle = Instance.new("TextLabel")
+BypassVooSpeedTitle.Name = "SpeedTitle"
+BypassVooSpeedTitle.Size = UDim2.new(1, -32, 0, 22)
+BypassVooSpeedTitle.Position = UDim2.new(0, 16, 0, 10)
+BypassVooSpeedTitle.BackgroundTransparency = 1
+BypassVooSpeedTitle.TextColor3 = Theme.Text
+BypassVooSpeedTitle.Font = Enum.Font.GothamBold
+BypassVooSpeedTitle.TextSize = 13
+BypassVooSpeedTitle.TextXAlignment = Enum.TextXAlignment.Left
+BypassVooSpeedTitle.Parent = BypassVooSpeedCard
+
+local BypassVooSpeedValue = Instance.new("TextLabel")
+BypassVooSpeedValue.Name = "SpeedValue"
+BypassVooSpeedValue.Size = UDim2.new(0, 72, 0, 22)
+BypassVooSpeedValue.Position = UDim2.new(1, -88, 0, 10)
+BypassVooSpeedValue.BackgroundTransparency = 1
+BypassVooSpeedValue.TextColor3 = Theme.Accent2
+BypassVooSpeedValue.Font = Enum.Font.GothamBold
+BypassVooSpeedValue.TextSize = 13
+BypassVooSpeedValue.TextXAlignment = Enum.TextXAlignment.Right
+BypassVooSpeedValue.Parent = BypassVooSpeedCard
+
+local BypassVooSpeedBar = Instance.new("TextButton")
+BypassVooSpeedBar.Name = "SpeedSlider"
+BypassVooSpeedBar.Size = UDim2.new(1, -40, 0, 8)
+BypassVooSpeedBar.Position = UDim2.new(0, 20, 0, 58)
+BypassVooSpeedBar.BackgroundColor3 = Theme.TrackOff
+BypassVooSpeedBar.BorderSizePixel = 0
+BypassVooSpeedBar.Text = ""
+BypassVooSpeedBar.AutoButtonColor = false
+BypassVooSpeedBar.Active = true
+BypassVooSpeedBar.Parent = BypassVooSpeedCard
+addCorner(BypassVooSpeedBar, 4)
+
+local BypassVooSpeedFill = Instance.new("Frame")
+BypassVooSpeedFill.Name = "SpeedFill"
+BypassVooSpeedFill.Size = UDim2.new(0, 0, 1, 0)
+BypassVooSpeedFill.BackgroundColor3 = Theme.Accent2
+BypassVooSpeedFill.BorderSizePixel = 0
+BypassVooSpeedFill.Active = false
+BypassVooSpeedFill.Parent = BypassVooSpeedBar
+addCorner(BypassVooSpeedFill, 4)
+addGradient(BypassVooSpeedFill, Theme.Accent1, Theme.Accent2, 0)
+
+local BypassVooSpeedKnob = Instance.new("Frame")
+BypassVooSpeedKnob.Name = "SpeedKnob"
+BypassVooSpeedKnob.Size = UDim2.fromOffset(16, 16)
+BypassVooSpeedKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+BypassVooSpeedKnob.Position = UDim2.new(0, 0, 0.5, 0)
+BypassVooSpeedKnob.BackgroundColor3 = Theme.Text
+BypassVooSpeedKnob.BorderSizePixel = 0
+BypassVooSpeedKnob.Active = false
+BypassVooSpeedKnob.Parent = BypassVooSpeedBar
+addCorner(BypassVooSpeedKnob, 8)
+addStroke(BypassVooSpeedKnob, Theme.Accent1, 1, 0.1)
+
+local BYPASS_VOO_SPEED_MIN = 10
+local BYPASS_VOO_SPEED_MAX = 200
+local bypassVooSpeedDragging = false
+
+local function renderBypassVooSpeed()
+    local speed = math.clamp(tonumber(AutoMob.FlightSpeed) or 100, BYPASS_VOO_SPEED_MIN, BYPASS_VOO_SPEED_MAX)
+    local ratio = (speed - BYPASS_VOO_SPEED_MIN) / (BYPASS_VOO_SPEED_MAX - BYPASS_VOO_SPEED_MIN)
+    BypassVooSpeedTitle.Text = "Velocidade de Voo"
+    BypassVooSpeedValue.Text = tostring(speed)
+    BypassVooSpeedFill.Size = UDim2.new(ratio, 0, 1, 0)
+    BypassVooSpeedKnob.Position = UDim2.new(ratio, 0, 0.5, 0)
+end
+
+local function updateBypassVooSpeedFromX(x)
+    local width = math.max(BypassVooSpeedBar.AbsoluteSize.X, 1)
+    local ratio = math.clamp((x - BypassVooSpeedBar.AbsolutePosition.X) / width, 0, 1)
+    local speed = math.floor(BYPASS_VOO_SPEED_MIN
+        + (BYPASS_VOO_SPEED_MAX - BYPASS_VOO_SPEED_MIN) * ratio + 0.5)
+    AutoMob.SetFlightSpeed(speed, false)
+    renderBypassVooSpeed()
+end
+
+BypassVooSpeedBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        bypassVooSpeedDragging = true
+        updateBypassVooSpeedFromX(input.Position.X)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if bypassVooSpeedDragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        updateBypassVooSpeedFromX(input.Position.X)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        if bypassVooSpeedDragging then
+            bypassVooSpeedDragging = false
+            AutoMob.SetFlightSpeed(AutoMob.FlightSpeed, true)
+        end
+    end
+end)
+
+renderBypassVooSpeed()
+end --// Bypass Voo UI
 
 --// ==========================================
 --// FPS BOOST — CENÁRIO LOCAL + SOMBRAS
@@ -8973,7 +10129,7 @@ end
 
 setOtimizacao, getOtimizacao = createToggleCard(
     ConfigScroll,
-    3,
+    5,
     "Fps Boost",
     false,
     function(state)
@@ -9173,7 +10329,7 @@ end
 
 setPerformanceVFX, getPerformanceVFX = createToggleCard(
     ConfigScroll,
-    4,
+    6,
     "Performance VFX",
     false,
     function(state)
@@ -9184,7 +10340,7 @@ setPerformanceVFX, getPerformanceVFX = createToggleCard(
 -- Toggle opcional para destacar localmente as estruturas já escondidas.
 local setLocate, getLocate = createToggleCard(
     ConfigScroll,
-    5,
+    7,
     "Localizar Estruturas",
     false,
     function(state)
@@ -9267,7 +10423,10 @@ local function toggleUI()
     if uiOpen then closeUI() else openUI() end
 end
 
-local function destroyScript()
+_G.__RamdomHubStop = function()
+    HUB_SETTINGS.BypassVoo = AutoMob.BypassVoo == true
+    HUB_SETTINGS.FlightSpeed = math.clamp(tonumber(AutoMob.FlightSpeed) or 100, 10, 200)
+    pcall(saveHubSettings)
     pcall(AutoRaid.Stop)
     pcall(AutoRaidAssist.Stop)
     pcall(AutoMob.Stop)
@@ -9287,7 +10446,6 @@ local function destroyScript()
     stopAntiAFK()
 end
 
-_G.__RamdomHubStop = destroyScript
 
 FloatingBtn.MouseEnter:Connect(function()
     tween(FloatingBtn, {Size = UDim2.new(0, 66, 0, 66)}, 0.15)
@@ -9296,30 +10454,32 @@ FloatingBtn.MouseLeave:Connect(function()
     tween(FloatingBtn, {Size = UDim2.new(0, 60, 0, 60)}, 0.15)
 end)
 
-local fDrag, fStart, fPos
+_G.__RamdomHubDragState = {Dragging = false, Start = nil, Position = nil}
 FloatingBtn.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        fDrag = true
-        fStart = input.Position
-        fPos = FloatingBtn.Position
+        _G.__RamdomHubDragState.Dragging = true
+        _G.__RamdomHubDragState.Start = input.Position
+        _G.__RamdomHubDragState.Position = FloatingBtn.Position
     end
 end)
 FloatingBtn.InputChanged:Connect(function(input)
-    if fDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - fStart
-        FloatingBtn.Position = UDim2.new(fPos.X.Scale, fPos.X.Offset + delta.X, fPos.Y.Scale, fPos.Y.Offset + delta.Y)
+    if _G.__RamdomHubDragState.Dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - _G.__RamdomHubDragState.Start
+        local startPosition = _G.__RamdomHubDragState.Position
+        FloatingBtn.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
     end
 end)
 FloatingBtn.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        local delta = (input.Position - fStart).Magnitude
+        local startInput = _G.__RamdomHubDragState.Start
+        local delta = startInput and (input.Position - startInput).Magnitude or math.huge
         if delta < 5 then toggleUI() end
-        fDrag = false
+        _G.__RamdomHubDragState.Dragging = false
     end
 end)
 
 CloseBtn.MouseButton1Click:Connect(function()
-    destroyScript()
+    _G.__RamdomHubStop()
 end)
 
 --// Animação de entrada
