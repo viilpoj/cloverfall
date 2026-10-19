@@ -1,8 +1,11 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.9                     ║
+    ║                 RAMDOM HUB  v1.95                    ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
+
+    v1.95:
+      + Grande Otimização no UI
 
     v1.9:
       + Adicionado Bypass Voo
@@ -43,7 +46,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.9",
+    Version = "1.95",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -724,6 +727,34 @@ do
     local STEER_NAME = "RamdomHubAutoMobSteer"
     local ignored = setmetatable({}, { __mode = "k" })
 
+    -- Compartilha uma lista curta de Humanoids entre Auto Farm, Auto Raid Assist
+    -- e Auto Raid V2. Isso evita recriar workspace:GetDescendants() em cada loop.
+    -- A lista é renovada com frequência; verificações de vida/ancestralidade continuam
+    -- sendo feitas no momento do uso para ignorar alvos que desapareceram.
+    local humanoidSnapshot = {}
+    local humanoidSnapshotAt = -math.huge
+    local HUMANOID_SNAPSHOT_TTL = 0.20
+
+    local function getHumanoidSnapshot()
+        local now = os.clock()
+        if now - humanoidSnapshotAt < HUMANOID_SNAPSHOT_TTL then
+            return humanoidSnapshot
+        end
+
+        local freshSnapshot = {}
+        for _, instance in ipairs(workspace:GetDescendants()) do
+            if instance:IsA("Humanoid") then
+                freshSnapshot[#freshSnapshot + 1] = instance
+            end
+        end
+
+        humanoidSnapshot = freshSnapshot
+        humanoidSnapshotAt = now
+        return humanoidSnapshot
+    end
+
+    AutoMob.GetHumanoidSnapshot = getHumanoidSnapshot
+
     local function isActive(token)
         return AutoMob.Enabled and AutoMob.Token == token
     end
@@ -779,7 +810,7 @@ do
         return false
     end
 
-    local function hasHealthBar(model, hum)
+    local function hasHealthBar(model, hum, descendants)
         local nativeOk, nativeBarEnabled = pcall(function()
             if hum.MaxHealth <= 0 or hum.HealthDisplayDistance <= 0
                 or hum.DisplayDistanceType == Enum.HumanoidDisplayDistanceType.None then
@@ -795,7 +826,7 @@ do
             return true
         end
 
-        for _, gui in ipairs(model:GetDescendants()) do
+        for _, gui in ipairs(descendants or model:GetDescendants()) do
             if gui:IsA("BillboardGui") and gui.Enabled then
                 if containsHealthBarHint(gui.Name) then
                     return true
@@ -819,24 +850,45 @@ do
         return false
     end
 
-    local function getMobLevel(model)
-        local lvl = model.Name:match("%[Lv%.?%s*(%d+)%]") or model.Name:match("[Ll]v%.?%s*(%d+)")
-        if lvl then return tonumber(lvl) end
+    local mobLevelCache = setmetatable({}, { __mode = "k" })
+    local MOB_LEVEL_CACHE_TTL = 1.0
 
-        for _, d in ipairs(model:GetDescendants()) do
-            if d:IsA("TextLabel") then
-                local text = d.Text
-                local lvlStr = text:match("[Ll]v%.?%s*(%d+)") or text:match("[Ll]evel%s*(%d+)")
-                if lvlStr then
-                    return tonumber(lvlStr)
+    local function getMobLevel(model)
+        if not (model and model:IsA("Model")) then return nil end
+
+        local now = os.clock()
+        local cached = mobLevelCache[model]
+        if cached and cached.Name == model.Name and cached.ExpiresAt > now then
+            return cached.Level
+        end
+
+        local lvl = model.Name:match("%[Lv%.?%s*(%d+)%]") or model.Name:match("[Ll]v%.?%s*(%d+)")
+        local level = tonumber(lvl)
+        if not level then
+            for _, d in ipairs(model:GetDescendants()) do
+                if d:IsA("TextLabel") then
+                    local text = d.Text
+                    local lvlStr = text:match("[Ll]v%.?%s*(%d+)") or text:match("[Ll]evel%s*(%d+)")
+                    if lvlStr then
+                        level = tonumber(lvlStr)
+                        break
+                    end
                 end
             end
         end
-        return nil
+
+        mobLevelCache[model] = {
+            Name = model.Name,
+            Level = level,
+            ExpiresAt = now + MOB_LEVEL_CACHE_TTL,
+        }
+        return level
     end
 
     local function isValidMob(model)
-        if not model or not model:IsA("Model") then return false end
+        if not (model and model:IsA("Model") and model.Parent and model:IsDescendantOf(workspace)) then
+            return false
+        end
         if model == player.Character then return false end
         if isPlayerModel(model) then return false end
         
@@ -849,10 +901,14 @@ do
 
         local hum = model:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then return false end
-        if not hasHealthBar(model, hum) then return false end
+
+        -- Reutiliza una sola lista de descendientes para comprobar tanto la barra de vida
+        -- como los interactivos; ambas comprobaciones se ejecutan a menudo durante el scan.
+        local descendants = model:GetDescendants()
+        if not hasHealthBar(model, hum, descendants) then return false end
 
         -- Interactivos suelen ser NPCs de diálogo/tienda/quest, no mobs de combate.
-        for _, d in ipairs(model:GetDescendants()) do
+        for _, d in ipairs(descendants) do
             if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
                 return false
             end
@@ -1972,7 +2028,7 @@ do
         local _, _, root = getChar()
 
         if root then
-            for _, d in ipairs(workspace:GetDescendants()) do
+            for _, d in ipairs(getHumanoidSnapshot()) do
                 if d:IsA("Humanoid") then
                     local model = d.Parent
                     if model and model:IsA("Model") then
@@ -2040,7 +2096,7 @@ do
             end
         end
 
-        for _, d in ipairs(workspace:GetDescendants()) do
+        for _, d in ipairs(getHumanoidSnapshot()) do
             if d:IsA("Humanoid") then
                 local model = d.Parent
                 if model and model:IsA("Model") then
@@ -2076,7 +2132,7 @@ do
         -- em qualquer ponto do mapa que esteja replicado/carregado no cliente.
         local best, bestDist = nil, selected and MOB_CFG.SelectedSearchRadius or MOB_CFG.SearchRadius
 
-        for _, d in ipairs(workspace:GetDescendants()) do
+        for _, d in ipairs(getHumanoidSnapshot()) do
             if d:IsA("Humanoid") and d.Health > 0 then
                 local model = d.Parent
                 if model and model:IsA("Model") and not isIgnored(model, now) then
@@ -7492,6 +7548,52 @@ local AutoRaidAssist = {
 do
     local STEER_NAME = "RamdomHubAutoRaidAssistAim"
     local lastMouseMove = 0
+    local controlledHumanoid = nil
+    local originalAutoRotate = nil
+
+    -- Restaura o comportamento normal de rotação do personagem ao parar a assistência
+    -- ou quando o personagem atual deixa de estar disponível.
+    local function restoreBodyFacing()
+        if controlledHumanoid and controlledHumanoid.Parent and originalAutoRotate ~= nil then
+            pcall(function()
+                controlledHumanoid.AutoRotate = originalAutoRotate
+            end)
+        end
+        controlledHumanoid = nil
+        originalAutoRotate = nil
+    end
+
+    -- Faz o corpo do personagem ficar de frente para o NPC no plano horizontal.
+    -- A câmera continua recebendo a assistência visual existente; este controle adicional
+    -- orienta também o HumanoidRootPart, sem inclinar o corpo para cima ou para baixo.
+    local function faceCharacterToward(aimPosition, dt)
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not (hum and root and hum.Health > 0) then
+            restoreBodyFacing()
+            return
+        end
+
+        if controlledHumanoid ~= hum then
+            restoreBodyFacing()
+            controlledHumanoid = hum
+            originalAutoRotate = hum.AutoRotate
+            pcall(function()
+                hum.AutoRotate = false
+            end)
+        end
+
+        local flatTarget = Vector3.new(aimPosition.X, root.Position.Y, aimPosition.Z)
+        local delta = flatTarget - root.Position
+        if delta.Magnitude <= 0.1 then return end
+
+        local desired = CFrame.lookAt(root.Position, flatTarget)
+        local alpha = math.clamp((dt or (1 / 60)) * 12, 0, 1)
+        pcall(function()
+            root.CFrame = root.CFrame:Lerp(desired, alpha)
+        end)
+    end
 
     local function getCharacterRoot()
         local char = player.Character
@@ -7540,8 +7642,9 @@ do
 
     local function findNearestMob(origin)
         local best, bestDistance = nil, math.huge
-        for _, item in ipairs(workspace:GetDescendants()) do
-            if item:IsA("Humanoid") and item.Health > 0 then
+        local humanoids = AutoMob.GetHumanoidSnapshot and AutoMob.GetHumanoidSnapshot() or {}
+        for _, item in ipairs(humanoids) do
+            if item.Parent and item:IsDescendantOf(workspace) and item.Health > 0 then
                 local model = item.Parent
                 if isValidAimMob(model) then
                     local root = getModelRoot(model)
@@ -7560,7 +7663,15 @@ do
     local function onRenderStep(dt)
         if not AutoRaidAssist.Enabled then return end
         local aimPosition = getAimPosition(AutoRaidAssist.Target)
-        if not aimPosition then return end
+        if not aimPosition then
+            restoreBodyFacing()
+            return
+        end
+
+        -- Além de apontar a câmera como antes, vira suavemente o corpo do jogador
+        -- para ficar de frente para o NPC acompanhado pela assistência.
+        faceCharacterToward(aimPosition, dt)
+
         local cam = workspace.CurrentCamera
         if not cam then return end
 
@@ -7628,6 +7739,7 @@ do
             AutoRaidAssist.Thread = nil
         end
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        restoreBodyFacing()
     end
 
     AutoRaidAssist.Start = startAssist
@@ -7635,7 +7747,7 @@ do
 end
 
 --// ==========================================
---// AUTO RAID V2 — segue a pé com W + Shift, alvo exclusivo até a morte
+--// AUTO RAID V2 — movimento por velocidade adaptativa, mantendo 30 studs do alvo
 --// ==========================================
 do
     local spawnConnection = nil
@@ -7645,7 +7757,12 @@ do
     local moveSequence = 0
     local steerPart = nil
     local STEER_NAME = "RamdomHubAutoRaidV2WalkSteer"
-    local STOP_DISTANCE = 5.5
+    -- Auto Raid V2 mantém uma zona de distância ao redor do NPC, em vez de
+    -- usar W + Shift continuamente para correr até encostar no alvo.
+    local STOP_DISTANCE = 30
+    local DISTANCE_TOLERANCE = 1.25
+    local controlledHumanoid = nil
+    local originalRaidWalkSpeed = nil
     local recovering = false
     local recoverySafeCFrame = nil
     local recoveryReturnCFrame = nil
@@ -7741,39 +7858,77 @@ do
         end
     end
 
-    local function setMoving(state, immediateShift)
-        if state then
-            if moving then
-                if immediateShift and moveWDown and not moveShiftDown then
-                    sendMoveKey(Enum.KeyCode.LeftShift, true)
-                    moveShiftDown = true
-                end
-                return
-            end
-
-            moving = true
-            moveSequence = moveSequence + 1
-            local thisSequence = moveSequence
-            -- Mesmo fluxo do Auto Farm: primeiro W, depois Shift esquerdo.
-            sendMoveKey(Enum.KeyCode.W, true)
-            moveWDown = true
-            if immediateShift then
-                sendMoveKey(Enum.KeyCode.LeftShift, true)
-                moveShiftDown = true
-            else
-                task.delay(0.35, function()
-                    if AutoRaidV2.Enabled and moving and moveSequence == thisSequence
-                        and moveWDown and not moveShiftDown then
-                        sendMoveKey(Enum.KeyCode.LeftShift, true)
-                        moveShiftDown = true
-                    end
-                end)
-            end
-        else
-            moving = false
-            moveSequence = moveSequence + 1
-            releaseMoveKeys()
+    local function setMoving(state, _immediateShift)
+        -- O Auto Raid V2 não pressiona mais W/Shift. O movimento é comandado
+        -- diretamente pelo Humanoid, com WalkSpeed ajustada conforme a distância.
+        if moving == state then return end
+        moving = state
+        moveSequence = moveSequence + 1
+        if not state then
+            releaseMoveKeys() -- limpeza defensiva de inputs de versões anteriores
         end
+    end
+
+    local function restoreRaidWalkSpeed()
+        if controlledHumanoid and controlledHumanoid.Parent and originalRaidWalkSpeed then
+            pcall(function()
+                controlledHumanoid.WalkSpeed = originalRaidWalkSpeed
+                controlledHumanoid:Move(Vector3.zero, false)
+            end)
+        end
+        controlledHumanoid = nil
+        originalRaidWalkSpeed = nil
+    end
+
+    local function applyDistanceControl(hum, root, targetRoot)
+        if not (hum and root and targetRoot and targetRoot.Parent) then return end
+
+        if controlledHumanoid ~= hum then
+            restoreRaidWalkSpeed()
+            controlledHumanoid = hum
+            originalRaidWalkSpeed = hum.WalkSpeed
+        end
+
+        local delta = targetRoot.Position - root.Position
+        local flatDelta = Vector3.new(delta.X, 0, delta.Z)
+        local distance = flatDelta.Magnitude
+        local distanceError = distance - STOP_DISTANCE
+
+        if math.abs(distanceError) <= DISTANCE_TOLERANCE then
+            -- Dentro da faixa de 30 studs: para de andar e preserva a distância.
+            hum.WalkSpeed = originalRaidWalkSpeed or hum.WalkSpeed
+            hum:Move(Vector3.zero, false)
+            return distance
+        end
+
+        if flatDelta.Magnitude < 0.05 then
+            local look = root.CFrame.LookVector
+            flatDelta = Vector3.new(look.X, 0, look.Z)
+            if flatDelta.Magnitude < 0.05 then
+                flatDelta = Vector3.new(0, 0, -1)
+            end
+        end
+
+        local direction
+        local speed
+        if distanceError > 0 then
+            -- Longe demais: aproximação progressiva; quanto maior a distância,
+            -- maior a velocidade até o limite baseado na velocidade original.
+            direction = flatDelta.Unit
+            local maxApproachSpeed = math.max(originalRaidWalkSpeed or 16, 16)
+            speed = math.clamp(6 + distanceError * 0.65, 6, maxApproachSpeed)
+        else
+            -- Perto demais: recua mais rápido para recuperar a distância desejada.
+            -- A velocidade aumenta conforme o personagem fica mais perto do alvo.
+            direction = -flatDelta.Unit
+            local baseWalkSpeed = originalRaidWalkSpeed or 16
+            local maxRetreatSpeed = math.clamp(baseWalkSpeed * 1.75, 24, 32)
+            speed = math.clamp(18 + math.abs(distanceError) * 0.8, 18, maxRetreatSpeed)
+        end
+
+        hum.WalkSpeed = speed
+        hum:Move(direction, false)
+        return distance
     end
 
     local AIM_ASSIST_DISTANCE = 12
@@ -7806,10 +7961,22 @@ do
     end
 
     local function onRenderStep(dt)
+        if not AutoRaidV2.Enabled then return end
+        local _, hum, root = getCharacter()
+        if not (hum and root) then
+            restoreRaidWalkSpeed()
+            return
+        end
+
         local part = steerPart
-        if not (AutoRaidV2.Enabled and part and part.Parent) then return end
-        local _, _, root = getCharacter()
-        if not root then return end
+        if moving and part and part.Parent then
+            applyDistanceControl(hum, root, part)
+        else
+            pcall(function() hum:Move(Vector3.zero, false) end)
+            restoreRaidWalkSpeed()
+        end
+
+        if not (part and part.Parent) then return end
         local cam = workspace.CurrentCamera
         if not cam then return end
 
@@ -7827,7 +7994,7 @@ do
             desired = CFrame.lookAt(cf.Position, fullAimPosition)
         elseif flat.Magnitude > 0.5 then
             -- Fora do alcance próximo, preserva a direção horizontal de navegação
-            -- para que W + Shift continue levando o personagem até o mesmo NPC.
+            -- para manter a orientação em direção ao mesmo NPC.
             local dir = flat.Unit
             local pitch = math.clamp(cf.LookVector.Y, -0.5, 0.5)
             local h = math.sqrt(1 - pitch * pitch)
@@ -7845,6 +8012,8 @@ do
 
     local function enqueueFactory(token)
         local queue = {}
+        local queueHead = 1
+        local queueTail = 0
         local queued = setmetatable({}, {__mode = "k"})
         local processed = setmetatable({}, {__mode = "k"})
 
@@ -7852,15 +8021,17 @@ do
             if not isActive(token) or not isEligibleTarget(model) then return false end
             if queued[model] or processed[model] or model == AutoRaidV2.Target then return false end
             queued[model] = true
-            table.insert(queue, model)
+            queueTail = queueTail + 1
+            queue[queueTail] = model
             return true
         end
 
         local function scanWorld(sortByDistance)
             if not isActive(token) then return end
             local candidates = {}
-            for _, item in ipairs(workspace:GetDescendants()) do
-                if item:IsA("Humanoid") then
+            local humanoids = AutoMob.GetHumanoidSnapshot and AutoMob.GetHumanoidSnapshot() or {}
+            for _, item in ipairs(humanoids) do
+                if item.Parent and item:IsDescendantOf(workspace) then
                     local model = item.Parent
                     if isEligibleTarget(model) and not queued[model] and not processed[model]
                         and model ~= AutoRaidV2.Target then
@@ -7880,18 +8051,31 @@ do
                     end)
                 end
             end
-            for _, model in ipairs(candidates) do table.insert(queue, model) end
+            for _, model in ipairs(candidates) do
+                queueTail = queueTail + 1
+                queue[queueTail] = model
+            end
         end
 
         local function popNext()
-            while #queue > 0 do
-                local model = table.remove(queue, 1)
-                queued[model] = nil
-                if isEligibleTarget(model) then
-                    processed[model] = true
-                    return model
+            while queueHead <= queueTail do
+                local model = queue[queueHead]
+                queue[queueHead] = nil
+                queueHead = queueHead + 1
+                if model then
+                    queued[model] = nil
+                    if isEligibleTarget(model) then
+                        processed[model] = true
+                        return model
+                    end
                 end
             end
+
+            -- Reinicia os índices quando a fila esvazia para não manter uma cauda
+            -- crescente durante sessões longas de Auto Raid V2.
+            queue = {}
+            queueHead = 1
+            queueTail = 0
             return nil
         end
 
@@ -8033,21 +8217,30 @@ do
                                     progressAt = now
                                 end
 
-                                if distance > STOP_DISTANCE then
+                                if distance > STOP_DISTANCE + DISTANCE_TOLERANCE then
                                     setMoving(true)
-                                    AutoRaidV2.Status = "indo até " .. tostring(target.Name)
+                                    AutoRaidV2.Status = "aproximando de " .. tostring(target.Name)
                                     if distance < bestDistance - 0.75 then
                                         bestDistance = distance
                                         progressAt = now
                                     end
-                                    -- Keep the same NPC until it dies/disappears; slow movement
-                                    -- does not cause target switching.
+                                    -- Ajusta a velocidade progressivamente; mantém o alvo atual.
+                                elseif distance < STOP_DISTANCE - DISTANCE_TOLERANCE then
+                                    setMoving(true)
+                                    AutoRaidV2.Status = "ajustando distância de " .. tostring(target.Name)
+                                    if math.abs(distance - STOP_DISTANCE) < math.abs(bestDistance - STOP_DISTANCE) then
+                                        bestDistance = distance
+                                        progressAt = now
+                                    end
                                 else
                                     setMoving(false)
-                                    pcall(function() hum:MoveTo(root.Position) end)
+                                    pcall(function()
+                                        hum:Move(Vector3.zero, false)
+                                        hum:MoveTo(root.Position)
+                                    end)
                                     bestDistance = distance
                                     progressAt = now
-                                    AutoRaidV2.Status = "atacando " .. tostring(target.Name)
+                                    AutoRaidV2.Status = "mantendo 30 studs de " .. tostring(target.Name)
                                 end
                             else
                                 setMoving(false)
@@ -8073,6 +8266,7 @@ do
         AutoRaidV2.Status = "desligado"
         setMoving(false)
         steerPart = nil
+        restoreRaidWalkSpeed()
         if recovering then
             local _, _, recoveryRoot = getCharacter()
             if recoveryRoot and recoveryReturnCFrame then
@@ -8719,7 +8913,8 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 1, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
+createUpdateCard(HomePage, 2, "v1.95", "+ Grande Otimização no UI", 70)
+createUpdateCard(HomePage, 3, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
 end --// ABA HOME (Changelog)
 
 --// ==========================================
@@ -9988,8 +10183,8 @@ local function restoreAllShadows()
     print("[RAMDOM HUB] Sombras restauradas!")
 end
 
-local function isInCameraView(part)
-    local camera = workspace.CurrentCamera
+local function isInCameraView(part, cameraOverride)
+    local camera = cameraOverride or workspace.CurrentCamera
     if not camera or not part or not part.Parent then return false end
     local ok, projected, onScreen = pcall(function()
         local point, visible = camera:WorldToViewportPoint(part.Position)
@@ -10003,13 +10198,14 @@ local function startVisibleStructureSweep()
     visibleSweepThread = task.spawn(function()
         while getOtimizacao and getOtimizacao() do
             local descendants = workspace:GetDescendants()
+            local currentCamera = workspace.CurrentCamera
             for index, obj in ipairs(descendants) do
                 if not (getOtimizacao and getOtimizacao()) then break end
                 if obj:IsA("BasePart")
                     and not StructureRecordByObject[obj]
                     and not isCharacterObject(obj)
                     and not isGroundPart(obj)
-                    and isInCameraView(obj) then
+                    and isInCameraView(obj, currentCamera) then
                     processStructure(obj)
                 end
                 if index % VISIBLE_SWEEP_YIELD_EVERY == 0 then
