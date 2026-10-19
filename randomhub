@@ -1,12 +1,12 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.6                     ║
+    ║                 RAMDOM HUB  v1.7                     ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
-    v1.6:
-      + Melhoria no Auto Raid
-      + Adicionado Performance de VFX (Reduz a Qualidade do VFX)
+    v1.7:
+      + Melhoria no Auto Wood
+      - Auto Wood Saiu do Beta
 ]]
 
 --// Serviços
@@ -39,7 +39,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.6",
+    Version = "1.7",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -69,6 +69,25 @@ local MOB_CFG = {
     AnyWhenNoSelection = true,   
     AttackOnlySelected = true,   
     HoldShiftWhileMoving = true, 
+
+    -- Recuperação automática quando houver um obstáculo físico à frente.
+    ObstacleRecoveryEnabled = true,
+    ObstacleRayDistance = 4.5,
+    ObstacleRayWidth = 0.65,
+    ObstacleRayHeights = {-0.55, 0.45},
+    ObstacleClearResetDelay = 0.65,
+    ObstacleRecoveryCooldown = 1.75,
+    ObstacleRetreatDistance = 2,
+    ObstacleRetreatTimeout = 1.5,
+    ObstacleJumpCount = 6,
+    -- Cada toque de Espaço é um clique curto, seguido de soltura imediata.
+    ObstacleJumpPressDuration = 0.025,
+    ObstacleJumpGap = 0.10,
+
+    -- Assistência de mira apenas no NPC/tipo selecionado e a até 12 studs.
+    CloseRangeAimEnabled = true,
+    CloseRangeAimDistance = 12,
+    CloseRangeAimLerp = 0.68,
 }
 
 local AutoMob = {
@@ -199,16 +218,21 @@ local WOOD_CFG = {
     ProgressColorTolerance = 0.08,
     NoProgressForwardDuration = 2.0,
 
-    -- Detecção de obstáculos e recuperação por pulos.
+    -- Recuperação de obstáculos igual ao Auto Farm: recuar 2 studs,
+    -- clicar Espaço 6 vezes (pressionamento curto + soltura) e repetir se
+    -- a barreira continuar à frente, respeitando um intervalo de segurança.
+    ObstacleRecoveryEnabled = true,
     ObstacleRayDistance = 4.5,
-    ObstacleCheckInterval = 0.25,
-    JumpCooldown = 2.5,
-    JumpPressDuration = 0.04,
-    JumpPressInterval = 0.10,
-    PostJumpPause = 0.18,
-    MaxJumpSequencesPerWalk = 2,
+    ObstacleRayWidth = 0.65,
+    ObstacleCheckInterval = 0.20,
+    ObstacleRecoveryCooldown = 1.75,
+    ObstacleRetreatDistance = 2,
+    ObstacleRetreatTimeout = 1.5,
+    ObstacleJumpCount = 6,
+    ObstacleJumpPressDuration = 0.025,
+    ObstacleJumpGap = 0.10,
 
-    -- Só pula se detectar bloqueio sólido e falta de avanço real.
+    -- Progresso mínimo para distinguir avanço real de ficar preso.
     StuckDetectDelay = 0.9,
     StuckMovementThreshold = 0.55,
 }
@@ -843,9 +867,16 @@ do
         end
     end
 
-    local function setMoving(state)
+    local function setMoving(state, immediateShift)
         if state then
-            if moving then return end
+            if moving then
+                -- Se a recuperação acabou, garante Shift imediatamente sem reiniciar W.
+                if immediateShift and MOB_CFG.HoldShiftWhileMoving and wDown and not shiftDown then
+                    sendMoveKey(Enum.KeyCode.LeftShift, true)
+                    shiftDown = true
+                end
+                return
+            end
 
             moving = true
             moveSequence = moveSequence + 1
@@ -856,20 +887,216 @@ do
             wDown = true
 
             if MOB_CFG.HoldShiftWhileMoving then
-                task.delay(0.35, function()
-                    -- Só ativa a corrida se o mesmo ciclo de movimento ainda estiver ativo.
-                    if moving and moveSequence == thisSequence and wDown
-                        and MOB_CFG.HoldShiftWhileMoving and not shiftDown then
-                        sendMoveKey(Enum.KeyCode.LeftShift, true)
-                        shiftDown = true
-                    end
-                end)
+                if immediateShift then
+                    -- Após a recuperação, retoma W + Shift sem o atraso normal.
+                    sendMoveKey(Enum.KeyCode.LeftShift, true)
+                    shiftDown = true
+                else
+                    task.delay(0.35, function()
+                        -- Só ativa a corrida se o mesmo ciclo de movimento ainda estiver ativo.
+                        if moving and moveSequence == thisSequence and wDown
+                            and MOB_CFG.HoldShiftWhileMoving and not shiftDown then
+                            sendMoveKey(Enum.KeyCode.LeftShift, true)
+                            shiftDown = true
+                        end
+                    end)
+                end
             end
         else
             moving = false
             moveSequence = moveSequence + 1 -- invalida qualquer atraso pendente
             releaseMoveKeys()
         end
+    end
+
+    -- Registra quando o obstáculo saiu da frente, mas permite repetir a recuperação
+    -- se ele continuar detectado após o intervalo de segurança.
+    local obstacleLatched = false
+    local obstacleClearSince = nil
+    local lastObstacleRecoveryAt = -math.huge
+    local recoverySpaceDown = false
+
+    local function getForwardDirection(root)
+        local cam = workspace.CurrentCamera
+        local look = (cam and cam.CFrame.LookVector) or root.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+
+        if flat.Magnitude < 0.05 then
+            local rootLook = root.CFrame.LookVector
+            flat = Vector3.new(rootLook.X, 0, rootLook.Z)
+        end
+
+        if flat.Magnitude < 0.05 then
+            return Vector3.new(0, 0, -1)
+        end
+        return flat.Unit
+    end
+
+    local function raycastPhysicalObstacle(origin, direction)
+        local exclusions = {}
+        local character = player.Character
+        if character then
+            table.insert(exclusions, character)
+        end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = exclusions
+        params.IgnoreWater = true
+        pcall(function()
+            params.RespectCanCollide = true
+        end)
+
+        -- Ignora modelos com Humanoid (incluindo o mob-alvo) e continua o Raycast
+        -- para detectar a parede ou peça sólida atrás deles.
+        for _ = 1, 12 do
+            local result = workspace:Raycast(origin, direction * MOB_CFG.ObstacleRayDistance, params)
+            if not result then
+                return nil
+            end
+
+            local ancestor = result.Instance
+            local humanoidModel = nil
+            while ancestor and ancestor ~= workspace do
+                if ancestor:IsA("Model") and ancestor:FindFirstChildOfClass("Humanoid") then
+                    humanoidModel = ancestor
+                    break
+                end
+                ancestor = ancestor.Parent
+            end
+
+            if humanoidModel then
+                table.insert(exclusions, humanoidModel)
+                params.FilterDescendantsInstances = exclusions
+            else
+                return result
+            end
+        end
+
+        return nil
+    end
+
+    local function detectFrontObstacle(root)
+        if not MOB_CFG.ObstacleRecoveryEnabled then
+            return nil
+        end
+
+        local forward = getForwardDirection(root)
+        local side = Vector3.new(-forward.Z, 0, forward.X)
+        local lateralOffsets = {-MOB_CFG.ObstacleRayWidth, 0, MOB_CFG.ObstacleRayWidth}
+
+        -- Dois níveis e três posições laterais ajudam a detectar paredes e obstáculos
+        -- sólidos sem confundir o chão com uma parede.
+        for _, heightOffset in ipairs(MOB_CFG.ObstacleRayHeights) do
+            for _, lateralOffset in ipairs(lateralOffsets) do
+                local origin = root.Position
+                    + Vector3.new(0, heightOffset, 0)
+                    + side * lateralOffset
+                local hit = raycastPhysicalObstacle(origin, forward)
+                if hit then
+                    return hit
+                end
+            end
+        end
+
+        return nil
+    end
+
+    local function retreatTwoStuds(hum, root, token)
+        if not (isActive(token) and hum and root and hum.Parent and root.Parent) then
+            return
+        end
+
+        local startPosition = root.Position
+        local backward = -getForwardDirection(root)
+        local destination = startPosition + backward * MOB_CFG.ObstacleRetreatDistance
+        -- Humanoid:MoveTo considera o destino alcançado quando chega a cerca de 1 stud.
+        -- O alvo de movimento fica 0,95 stud além do destino desejado para compensar isso.
+        local moveTarget = destination + backward * 0.95
+        local reachedDestination = false
+        local finishedConnection
+
+        finishedConnection = hum.MoveToFinished:Connect(function(reached)
+            if reached then
+                reachedDestination = true
+            end
+        end)
+
+        -- O destino fica exatamente 2 studs atrás do ponto inicial. A movimentação
+        -- usa MoveTo e possui limite de tempo para não prender o Auto Farm.
+        hum:MoveTo(moveTarget)
+        local deadline = os.clock() + MOB_CFG.ObstacleRetreatTimeout
+        while isActive(token) and hum.Parent and root.Parent do
+            local delta = root.Position - destination
+            local horizontalDistance = Vector3.new(delta.X, 0, delta.Z).Magnitude
+            if horizontalDistance <= 0.25 or reachedDestination then
+                break
+            end
+            if os.clock() >= deadline then
+                break
+            end
+            task.wait(0.025)
+        end
+
+        pcall(function()
+            hum:MoveTo(root.Position)
+        end)
+        if finishedConnection then
+            finishedConnection:Disconnect()
+        end
+    end
+
+    local function performOneObstacleJump(token)
+        if not isActive(token) then
+            return false
+        end
+
+        -- Um clique curto em Espaço: pressiona e solta. Não espera o pouso.
+        sendMoveKey(Enum.KeyCode.Space, true)
+        recoverySpaceDown = true
+        task.wait(MOB_CFG.ObstacleJumpPressDuration)
+        sendMoveKey(Enum.KeyCode.Space, false)
+        recoverySpaceDown = false
+
+        return isActive(token)
+    end
+
+    local function performObstacleRecovery(hum, root, token)
+        -- Solta W/Shift antes de recuar para que as entradas não disputem o movimento.
+        setMoving(false)
+        sendMoveKey(Enum.KeyCode.S, false)
+        sendMoveKey(Enum.KeyCode.Space, false)
+        recoverySpaceDown = false
+
+        retreatTwoStuds(hum, root, token)
+        if not isActive(token) then
+            sendMoveKey(Enum.KeyCode.Space, false)
+            recoverySpaceDown = false
+            return false
+        end
+
+        for jumpIndex = 1, MOB_CFG.ObstacleJumpCount do
+            if not performOneObstacleJump(token) then
+                break
+            end
+
+            -- Intervalo entre cliques, nunca mantém Espaço pressionado.
+            -- Após o sexto clique, prossegue sem pausa adicional.
+            if jumpIndex < MOB_CFG.ObstacleJumpCount then
+                task.wait(MOB_CFG.ObstacleJumpGap)
+            end
+        end
+
+        -- Nunca deixa Espaço preso, inclusive se o Auto Farm for desligado no meio.
+        sendMoveKey(Enum.KeyCode.Space, false)
+        recoverySpaceDown = false
+        sendMoveKey(Enum.KeyCode.S, false)
+
+        -- Retoma imediatamente mantendo W e Shift esquerdo pressionados.
+        if isActive(token) then
+            setMoving(true, true)
+        end
+        return isActive(token)
     end
 
     local function onRenderStep()
@@ -882,6 +1109,34 @@ do
         local cam = workspace.CurrentCamera
         if not cam then return end
 
+        -- A assistência de mira fica restrita ao alvo atual que corresponde à
+        -- seleção do usuário e só entra quando ele está a 12 studs ou menos.
+        local selectedMob = AutoMob.Target
+        if MOB_CFG.CloseRangeAimEnabled and selectedMob and mobAlive(selectedMob)
+            and hasSelection() and matchesSelection(selectedMob) then
+            local targetRoot = modelRoot(selectedMob)
+            if targetRoot then
+                local distance = (targetRoot.Position - root.Position).Magnitude
+                if distance <= MOB_CFG.CloseRangeAimDistance then
+                    local aimPart = selectedMob:FindFirstChild("UpperTorso")
+                        or selectedMob:FindFirstChild("Torso")
+                        or selectedMob:FindFirstChild("Head")
+                        or targetRoot
+                    if aimPart and aimPart:IsA("BasePart") then
+                        local aimPosition = aimPart.Position
+                        local direction = aimPosition - cam.CFrame.Position
+                        if direction.Magnitude > 0.1 then
+                            local desired = CFrame.lookAt(cam.CFrame.Position, aimPosition)
+                            cam.CFrame = cam.CFrame:Lerp(desired, MOB_CFG.CloseRangeAimLerp)
+                            return
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Mantém o direcionamento horizontal usado para navegar até o mob; ele
+        -- não é a assistência de mira de curta distância acima.
         local target = part.Position
         local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
         if flat.Magnitude > 0.5 then
@@ -1118,8 +1373,42 @@ do
                     faceTo(root, mr.Position)
                     lastNear, progressAt, bestDist = now, now, dist
                 else
-                    setMoving(true)
-                    setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
+                    local recoveredFromObstacle = false
+                    if MOB_CFG.ObstacleRecoveryEnabled then
+                        local obstacleHit = detectFrontObstacle(root)
+                        if obstacleHit then
+                            obstacleClearSince = nil
+                            -- Se o mesmo obstáculo continuar à frente, repete a sequência
+                            -- após o cooldown em vez de bloquear novas tentativas pelo latch.
+                            if now - lastObstacleRecoveryAt >= MOB_CFG.ObstacleRecoveryCooldown then
+                                obstacleLatched = true
+                                setStatus("obstáculo à frente: recuando e pulando", true)
+                                recoveredFromObstacle = performObstacleRecovery(hum, root, token)
+                                -- O intervalo de segurança começa ao terminar a sequência.
+                                lastObstacleRecoveryAt = os.clock()
+
+                                if recoveredFromObstacle and isActive(token) and mr.Parent then
+                                    dist = (root.Position - mr.Position).Magnitude
+                                    now = os.clock()
+                                    bestDist = dist
+                                    progressAt = now
+                                    lastNear = now
+                                end
+                            end
+                        elseif obstacleLatched then
+                            if not obstacleClearSince then
+                                obstacleClearSince = now
+                            elseif now - obstacleClearSince >= MOB_CFG.ObstacleClearResetDelay then
+                                obstacleLatched = false
+                                obstacleClearSince = nil
+                            end
+                        end
+                    end
+
+                    if isActive(token) then
+                        setMoving(true)
+                        setStatus(string.format("indo até %s (%d studs)", mob.Name, math.floor(dist)))
+                    end
                     -- O deslocamento até o alvo é feito pelo controle normal do jogo:
                     -- W fica pressionado e Shift é acionado após 0,35 segundo.
                     -- Não chamar MoveTo(mr.Position) aqui evita competir com o input de corrida.
@@ -1202,6 +1491,12 @@ do
             AutoMob.Thread = nil
         end
 
+        obstacleLatched = false
+        obstacleClearSince = nil
+        lastObstacleRecoveryAt = -math.huge
+        recoverySpaceDown = false
+        sendMoveKey(Enum.KeyCode.Space, false)
+        sendMoveKey(Enum.KeyCode.S, false)
         setStatus("procurando mob...", true)
 
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
@@ -1213,6 +1508,9 @@ do
                 if not ok then
                     warn("[RAMDOM HUB] Auto Farm erro: " .. tostring(err))
                     setMoving(false)
+                    sendMoveKey(Enum.KeyCode.S, false)
+                    sendMoveKey(Enum.KeyCode.Space, false)
+                    recoverySpaceDown = false
                     steerPart = nil
                     AutoMob.Target = nil
                     setStatus("erro: " .. tostring(err), true)
@@ -1236,6 +1534,12 @@ do
         AutoMob.Target = nil
         steerPart = nil
         setMoving(false)
+        -- Libera também teclas temporárias usadas durante a recuperação.
+        sendMoveKey(Enum.KeyCode.S, false)
+        sendMoveKey(Enum.KeyCode.Space, false)
+        recoverySpaceDown = false
+        obstacleLatched = false
+        obstacleClearSince = nil
         setStatus("desligado", true)
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
 
@@ -3069,8 +3373,9 @@ do
     local boostedHumanoid = nil
     local originalWalkSpeed = nil
     local forwardKeyDown = false
+    local shiftKeyDown = false
     local spaceKeyDown = false
-    local lastObstacleJumpAt = -math.huge
+    local lastObstacleRecoveryAt = -math.huge
 
     local function isActive(token)
         return AutoWood.Enabled and AutoWood.Token == token
@@ -3093,6 +3398,8 @@ do
         end)
         if keyCode == Enum.KeyCode.W and ok then
             forwardKeyDown = down
+        elseif keyCode == Enum.KeyCode.LeftShift and ok then
+            shiftKeyDown = down
         elseif keyCode == Enum.KeyCode.Space and ok then
             spaceKeyDown = down
         end
@@ -3101,12 +3408,16 @@ do
     local function releaseWoodKeys()
         -- Força a liberação mesmo se a rotina for cancelada durante uma espera.
         pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+        end)
+        pcall(function()
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.W, false, game)
         end)
         pcall(function()
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
         end)
         forwardKeyDown = false
+        shiftKeyDown = false
         spaceKeyDown = false
     end
 
@@ -3676,11 +3987,71 @@ do
         return part
     end
 
+    -- O Auto Wood pode ter selecionado o tronco como alvo, enquanto folhas,
+    -- galhos ou outras partes da mesma árvore ficam fora da instância-alvo.
+    -- Essas partes não devem iniciar a recuperação de obstáculos.
+    local TREE_OBSTACLE_NAME_HINTS = {
+        "tree", "trees", "arvore", "arvores", "árvore", "árvores",
+        "trunk", "branch", "branches", "leaf", "leaves", "foliage", "bark",
+        "galho", "galhos", "folha", "folhas", "copa", "ramo", "ramos",
+    }
+
+    local function isTreeRelatedName(name)
+        local s = normalizeName(name)
+        for _, hint in ipairs(TREE_OBSTACLE_NAME_HINTS) do
+            if s == hint or s:find("%f[%a]" .. hint .. "%f[%A]") then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function nearestModelAncestor(inst)
+        local cur = inst
+        while cur and cur ~= workspace do
+            if cur:IsA("Model") then return cur end
+            cur = cur.Parent
+        end
+        return nil
+    end
+
+    local function isTreePartForObstacleCheck(part, target)
+        if not part then return false end
+
+        -- Se o alvo ou um dos seus ancestrais/descendentes foi atingido, trata-se
+        -- da árvore que o Auto Wood está tentando colher, não de uma parede.
+        if target then
+            if part == target or part:IsDescendantOf(target) or target:IsDescendantOf(part) then
+                return true
+            end
+
+            -- Vários jogos guardam o tronco, as folhas e os galhos no mesmo Model.
+            -- Ignora os outros componentes desse mesmo Model quando o tronco é o alvo.
+            local hitModel = nearestModelAncestor(part)
+            local targetModel = nearestModelAncestor(target)
+            if hitModel and targetModel and hitModel == targetModel then
+                return true
+            end
+        end
+
+        -- Também ignora componentes reconhecíveis de árvores, mesmo quando estão
+        -- fora do Model selecionado pelo Auto Wood.
+        local cur = part
+        while cur and cur ~= workspace do
+            if isTreeRelatedName(cur.Name) then
+                return true
+            end
+            cur = cur.Parent
+        end
+        return false
+    end
+
     local function getBlockingObstacle(root, direction, target)
-        if not root or not direction then return nil end
+        if not (WOOD_CFG.ObstacleRecoveryEnabled and root and direction) then return nil end
         local flatDirection = Vector3.new(direction.X, 0, direction.Z)
         if flatDirection.Magnitude < 0.1 then return nil end
         flatDirection = flatDirection.Unit
+        local side = Vector3.new(-flatDirection.Z, 0, flatDirection.X)
 
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
@@ -3688,19 +4059,28 @@ do
         if player.Character then table.insert(filters, player.Character) end
         if target then table.insert(filters, target) end
         params.FilterDescendantsInstances = filters
-        params.RespectCanCollide = true
+        params.IgnoreWater = true
+        pcall(function() params.RespectCanCollide = true end)
 
         local counts = {}
         local centerHitIdentity = nil
-        local heights = { 0.35, 1.25, 2.15 }
-        for index, height in ipairs(heights) do
-            local origin = root.Position + Vector3.new(0, height, 0)
-            local hit = workspace:Raycast(origin, flatDirection * WOOD_CFG.ObstacleRayDistance, params)
-            if hit and hit.Instance and hit.Instance.CanCollide and hit.Distance >= 1.0 then
-                local identity = getObstacleIdentity(hit.Instance, target)
-                if identity then
-                    counts[identity] = (counts[identity] or 0) + 1
-                    if index == 2 then centerHitIdentity = identity end
+        local heights = {0.35, 1.25, 2.15}
+        local lateralOffsets = {-WOOD_CFG.ObstacleRayWidth, 0, WOOD_CFG.ObstacleRayWidth}
+        for heightIndex, height in ipairs(heights) do
+            for lateralIndex, lateralOffset in ipairs(lateralOffsets) do
+                local origin = root.Position + Vector3.new(0, height, 0) + side * lateralOffset
+                local hit = workspace:Raycast(origin, flatDirection * WOOD_CFG.ObstacleRayDistance, params)
+                if hit and hit.Instance and hit.Instance.CanCollide and hit.Distance >= 1.0 then
+                    -- Não considerar o tronco/copa/galhos da árvore como obstáculo.
+                    if not isTreePartForObstacleCheck(hit.Instance, target) then
+                        local identity = getObstacleIdentity(hit.Instance, target)
+                        if identity then
+                            counts[identity] = (counts[identity] or 0) + 1
+                            if heightIndex == 2 and lateralIndex == 2 then
+                                centerHitIdentity = identity
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -3711,45 +4091,117 @@ do
                 best, bestCount = identity, count
             end
         end
-        -- Dois raios concordantes são evidência forte; o raio central também
-        -- pode confirmar um obstáculo sólido e próximo, como um poste estreito.
+        -- Vários raios concordantes detectam paredes largas; o raio central
+        -- também confirma obstáculos estreitos, como postes.
         if best and bestCount >= 2 then return best end
         if centerHitIdentity then return centerHitIdentity end
         return nil
     end
 
-    local function pressSpaceThreeTimes(token)
-        if not isActive(token) then return false end
-        if os.clock() - lastObstacleJumpAt < WOOD_CFG.JumpCooldown then return false end
-        lastObstacleJumpAt = os.clock()
+    local function getWoodForwardDirection(root, suggestedDirection)
+        local flat = suggestedDirection and Vector3.new(suggestedDirection.X, 0, suggestedDirection.Z)
+        if not flat or flat.Magnitude < 0.05 then
+            local cam = workspace.CurrentCamera
+            local look = cam and cam.CFrame.LookVector or root.CFrame.LookVector
+            flat = Vector3.new(look.X, 0, look.Z)
+        end
+        if flat.Magnitude < 0.05 then
+            local look = root.CFrame.LookVector
+            flat = Vector3.new(look.X, 0, look.Z)
+        end
+        if flat.Magnitude < 0.05 then return Vector3.new(0, 0, -1) end
+        return flat.Unit
+    end
 
-        for index = 1, 3 do
+    local function retreatWoodTwoStuds(hum, root, token, forwardDirection)
+        if not (isActive(token) and hum and root and hum.Parent and root.Parent) then
+            return false
+        end
+
+        local startPosition = root.Position
+        local backward = -getWoodForwardDirection(root, forwardDirection)
+        local destination = startPosition + backward * WOOD_CFG.ObstacleRetreatDistance
+        -- Compensa a tolerância de chegada do Humanoid:MoveTo para recuar
+        -- aproximadamente 2 studs reais, em vez de parar antes do destino.
+        local moveTarget = destination + backward * 0.95
+        local reached = false
+        local connection = hum.MoveToFinished:Connect(function(success)
+            if success then reached = true end
+        end)
+
+        hum:MoveTo(moveTarget)
+        local deadline = os.clock() + WOOD_CFG.ObstacleRetreatTimeout
+        while isActive(token) and hum.Parent and root.Parent do
+            local delta = root.Position - destination
+            local dist = Vector3.new(delta.X, 0, delta.Z).Magnitude
+            if dist <= 0.25 or reached or os.clock() >= deadline then break end
+            task.wait(0.025)
+        end
+
+        pcall(function() hum:MoveTo(root.Position) end)
+        if connection then connection:Disconnect() end
+        return isActive(token)
+    end
+
+    local function performWoodObstacleRecovery(token, target, forwardDirection, resumePosition)
+        if not isActive(token) then
+            releaseWoodKeys()
+            return false
+        end
+        if os.clock() - lastObstacleRecoveryAt < WOOD_CFG.ObstacleRecoveryCooldown then
+            return false
+        end
+
+        local _, hum, root = getChar()
+        if not (hum and root) then return false end
+
+        -- Interrompe o avanço atual e libera todas as teclas antes do recuo.
+        sendWoodKey(Enum.KeyCode.W, false)
+        sendWoodKey(Enum.KeyCode.LeftShift, false)
+        sendWoodKey(Enum.KeyCode.Space, false)
+        pcall(function() hum:MoveTo(root.Position) end)
+        setWalkSpeedBoost(true)
+
+        if not retreatWoodTwoStuds(hum, root, token, forwardDirection) then
+            releaseWoodKeys()
+            return false
+        end
+
+        -- Seis cliques separados: Espaço é solto em cada repetição; não espera
+        -- o personagem pousar e não mantém a tecla pressionada.
+        for index = 1, WOOD_CFG.ObstacleJumpCount do
             if not isActive(token) then
                 releaseWoodKeys()
                 return false
             end
             sendWoodKey(Enum.KeyCode.Space, true)
             local pressedAt = os.clock()
-            while isActive(token) and os.clock() - pressedAt < WOOD_CFG.JumpPressDuration do
-                task.wait(0.01)
+            while isActive(token)
+                and os.clock() - pressedAt < WOOD_CFG.ObstacleJumpPressDuration do
+                task.wait(0.005)
             end
             sendWoodKey(Enum.KeyCode.Space, false)
             if not isActive(token) then
                 releaseWoodKeys()
                 return false
             end
-            if index < 3 then
-                local gapUntil = os.clock() + WOOD_CFG.JumpPressInterval
+            if index < WOOD_CFG.ObstacleJumpCount then
+                local gapUntil = os.clock() + WOOD_CFG.ObstacleJumpGap
                 while isActive(token) and os.clock() < gapUntil do
-                    task.wait(0.01)
+                    task.wait(0.005)
                 end
             end
         end
 
-        local pauseUntil = os.clock() + WOOD_CFG.PostJumpPause
-        while isActive(token) and os.clock() < pauseUntil do
-            task.wait(0.02)
+        -- Depois do sexto clique, não simula W nem Shift esquerdo.
+        -- O Auto Wood retoma pelo movimento normal de waypoint (Humanoid:MoveTo).
+        sendWoodKey(Enum.KeyCode.Space, false)
+        sendWoodKey(Enum.KeyCode.W, false)
+        sendWoodKey(Enum.KeyCode.LeftShift, false)
+        if resumePosition and isActive(token) then
+            pcall(function() hum:MoveTo(resumePosition) end)
         end
+        lastObstacleRecoveryAt = os.clock()
         return isActive(token)
     end
 
@@ -3759,12 +4211,10 @@ do
 
         setWalkSpeedBoost(true)
         sendWoodKey(Enum.KeyCode.W, true)
+        sendWoodKey(Enum.KeyCode.LeftShift, true)
         local finishAt = os.clock() + WOOD_CFG.NoProgressForwardDuration
         local nextObstacleCheck = 0
-        local jumpedFor = nil
-        local jumpSequences = 0
         local lastProgressPos = root.Position
-        local lastProgressAt = os.clock()
 
         while isActive(token) and os.clock() < finishAt do
             local _, humNow, rootNow = getChar()
@@ -3772,23 +4222,20 @@ do
             local now = os.clock()
             if horizontalDistance(rootNow.Position, lastProgressPos) >= WOOD_CFG.StuckMovementThreshold then
                 lastProgressPos = rootNow.Position
-                lastProgressAt = now
-                jumpedFor = nil
             end
+
             if now >= nextObstacleCheck then
                 local cam = workspace.CurrentCamera
                 local forward = cam and cam.CFrame.LookVector or rootNow.CFrame.LookVector
                 local obstacle = getBlockingObstacle(rootNow, forward, target)
-                local stalled = now - lastProgressAt >= WOOD_CFG.StuckDetectDelay
-                if not obstacle then
-                    jumpedFor = nil
-                elseif stalled and obstacle ~= jumpedFor and jumpSequences < 1
-                    and now - lastObstacleJumpAt >= WOOD_CFG.JumpCooldown then
-                    if pressSpaceThreeTimes(token) then
-                        jumpedFor = obstacle
-                        jumpSequences = jumpSequences + 1
-                        lastProgressAt = os.clock()
-                        lastProgressPos = rootNow.Position
+                if obstacle and now - lastObstacleRecoveryAt >= WOOD_CFG.ObstacleRecoveryCooldown then
+                    if performWoodObstacleRecovery(token, target, forward, nil) then
+                        local _, resumedHum, resumedRoot = getChar()
+                        if resumedHum and resumedRoot then
+                            lastProgressPos = resumedRoot.Position
+                        end
+                        -- Conta o período de avanço a partir do fim da recuperação.
+                        finishAt = os.clock() + WOOD_CFG.NoProgressForwardDuration
                     end
                 end
                 nextObstacleCheck = os.clock() + WOOD_CFG.ObstacleCheckInterval
@@ -3797,6 +4244,7 @@ do
         end
 
         sendWoodKey(Enum.KeyCode.W, false)
+        sendWoodKey(Enum.KeyCode.LeftShift, false)
         setWalkSpeedBoost(false)
         return isActive(token)
     end
@@ -3959,13 +4407,14 @@ do
         setWalkSpeedBoost(true)
         local started = os.clock()
         local function finish(success)
+            sendWoodKey(Enum.KeyCode.W, false)
+            sendWoodKey(Enum.KeyCode.LeftShift, false)
+            sendWoodKey(Enum.KeyCode.Space, false)
             setWalkSpeedBoost(false)
             return success
         end
 
-        local jumpSequences = 0
         local nextObstacleCheck = 0
-        local lastObstaclePart = nil
         for _, waypoint in ipairs(waypoints) do
             if not isActive(token) then return finish(false) end
             if not inst.Parent or not inst:IsDescendantOf(workspace) then return finish(false) end
@@ -3994,30 +4443,23 @@ do
                 if (rootNow.Position - lastPos).Magnitude >= WOOD_CFG.StuckMovementThreshold then
                     lastPos = rootNow.Position
                     lastProgressAt = now
-                    lastObstaclePart = nil
                 elseif now - lastProgressAt >= 4 then
                     break
                 end
 
-                -- Só pula quando há bloqueio sólido à frente E o personagem parou
-                -- de avançar. A árvore-alvo fica excluída dos raycasts.
+                -- Detecta obstáculos sólidos na direção do waypoint. A mesma parede
+                -- pode disparar novamente após o cooldown, sem limite por trajeto.
                 if now >= nextObstacleCheck then
                     local direction = waypoint.Position - rootNow.Position
                     local obstacle = getBlockingObstacle(rootNow, direction, inst)
-                    if not obstacle and now - lastProgressAt >= WOOD_CFG.StuckDetectDelay then
-                        obstacle = getBlockingObstacle(rootNow, rootNow.CFrame.LookVector, inst)
-                    end
-                    local stalled = now - lastProgressAt >= WOOD_CFG.StuckDetectDelay
-                    if not obstacle then
-                        lastObstaclePart = nil
-                    elseif stalled and obstacle ~= lastObstaclePart
-                        and jumpSequences < WOOD_CFG.MaxJumpSequencesPerWalk
-                        and now - lastObstacleJumpAt >= WOOD_CFG.JumpCooldown then
-                        if pressSpaceThreeTimes(token) then
-                            jumpSequences = jumpSequences + 1
-                            lastObstaclePart = obstacle
-                            lastPos = rootNow.Position
-                            lastProgressAt = os.clock()
+                    if obstacle and now - lastObstacleRecoveryAt >= WOOD_CFG.ObstacleRecoveryCooldown then
+                        if performWoodObstacleRecovery(token, inst, direction, waypoint.Position) then
+                            local _, resumedHum, resumedRoot = getChar()
+                            if resumedHum and resumedRoot then
+                                pcall(function() resumedHum:MoveTo(waypoint.Position) end)
+                                lastPos = resumedRoot.Position
+                                lastProgressAt = os.clock()
+                            end
                         end
                     end
                     nextObstacleCheck = os.clock() + WOOD_CFG.ObstacleCheckInterval
@@ -4178,7 +4620,7 @@ do
         local token = AutoWood.Token
         for target in pairs(ignored) do ignored[target] = nil end
         aimTarget = nil
-        lastObstacleJumpAt = -math.huge
+        lastObstacleRecoveryAt = -math.huge
         releaseWoodKeys()
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
         RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 1, onRenderStep)
@@ -5208,6 +5650,7 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
+createUpdateCard(HomePage, 1, "v1.7", "+ Melhoria no Auto Wood\n- Auto Wood Saiu do Beta", 100)
 createUpdateCard(HomePage, 2, "v1.6", "+ Melhoria no Auto Raid\n+ Adicionado Performance de VFX (Reduz a Qualidade do VFX)", 100)
 
 --// ==========================================
@@ -5642,7 +6085,7 @@ setAutoMiner, getAutoMiner = createToggleCard(
 setAutoWood, getAutoWood = createToggleCard(
     AutoMinerPage,
     2,
-    "Auto Wood (Beta)",
+    "Auto Wood",
     false,
     function(state)
         if state then
