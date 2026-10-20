@@ -1,8 +1,11 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v2.1                    ║
+    ║                 RAMDOM HUB  v2.15                   ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
+
+    v2.15:
+      + Improvements to Auto Raid and Auto Raid V2
 
     v2.1:
       + Auto Farm Improvements
@@ -49,7 +52,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "2.1",
+    Version = "2.15",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -121,7 +124,7 @@ local setAutoWood, getAutoWood
 local setAutoFishing, getAutoFishing
 local setAutoRaid, getAutoRaid
 local setAutoRaidV2, getAutoRaidV2
-local setAutoRaidAssist, getAutoRaidAssist
+local startRaidAimAssist, stopRaidAimAssist
 local setLocateStructures, getLocateStructures
 
 --// ==========================================
@@ -353,8 +356,8 @@ local AutoRaid = {
 }
 
 
---// Auto Raid V2: caminha até um NPC por vez, mantém o alvo até morrer e
---// integra assistência de mira suave no NPC atual quando estiver a até 12 studs.
+--// Auto Raid V2: caminha até um NPC por vez, mantém o alvo até morrer.
+--// A assistência compartilhada mantém a mira no alvo atual inclusive durante recuperação.
 local AutoRaidV2 = {
     Enabled = false,
     Token = 0,
@@ -383,6 +386,7 @@ local CombatCfg = {
     EquipThread = nil,
 
     AutoSkillEnabled = false,
+    AutoSkillPausedForRaidRecovery = false,
     SkillInterval = 1,           
     SkillKeyGap = 0.12,          
     SelectedSkills = {},
@@ -7466,7 +7470,7 @@ do
     AutoFishing.Stop = stopAutoFishing
 end
 
---// AUTO RAID — VOO ESTÁVEL (SEM ASSISTÊNCIA DE MIRA INTEGRADA)
+--// AUTO RAID — VOO ESTÁVEL (COM ASSISTÊNCIA DE MIRA COMPARTILHADA)
 --// ==========================================
 do
     local STEER_NAME = "RamdomHubAutoRaidPoseLock"
@@ -7687,6 +7691,7 @@ do
         AutoRaid.Enabled = true
         AutoRaid.Token = AutoRaid.Token + 1
         local token = AutoRaid.Token
+        if startRaidAimAssist then startRaidAimAssist() end
         AutoRaid.Target = nil
         AutoRaid.AimPosition = nil
         removeHoverForces()
@@ -7738,7 +7743,10 @@ do
     end
 
     local function stopAutoRaid()
-        if not AutoRaid.Enabled and not bodyPosition and not bodyGyro then return end
+        if not AutoRaid.Enabled and not bodyPosition and not bodyGyro then
+            if stopRaidAimAssist then stopRaidAimAssist() end
+            return
+        end
         AutoRaid.Enabled = false
         AutoRaid.Token = AutoRaid.Token + 1
         AutoRaid.Target = nil
@@ -7753,6 +7761,7 @@ do
             orientationLockConnection = nil
         end
         removeHoverForces()
+        if stopRaidAimAssist then stopRaidAimAssist() end
     end
 
     AutoRaid.Start = startAutoRaid
@@ -7761,7 +7770,7 @@ do
 end
 
 --// ==========================================
---// AUTO RAID — ASSISTÊNCIA DE MIRA INDEPENDENTE (SOMENTE MOBS)
+--// AUTO RAID — ASSISTÊNCIA DE MIRA COMPARTILHADA (INTERNA)
 --// ==========================================
 local AutoRaidAssist = {
     Enabled = false,
@@ -7774,7 +7783,7 @@ local AutoRaidAssist = {
 
 do
     local STEER_NAME = "RamdomHubAutoRaidAssistAim"
-    local lastMouseMove = 0
+    local RAID_AIM_LERP_SPEED = 60
     local controlledHumanoid = nil
     local originalAutoRotate = nil
 
@@ -7853,18 +7862,24 @@ do
 
     local function getAimPosition(model)
         if not isValidAimMob(model) then return nil end
-        local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
-        if torso and torso:IsA("BasePart") then return torso.Position end
-        local root = getModelRoot(model)
-        if not root then return nil end
-        local ok, _, size = pcall(function()
-            local cf, bounds = model:GetBoundingBox()
-            return cf, bounds
-        end)
-        if ok and typeof(size) == "Vector3" then
-            return Vector3.new(root.Position.X, root.Position.Y + math.clamp(size.Y * 0.12, 1, 3), root.Position.Z)
+
+        -- Igual ao Auto Raid V2: prioriza a cabeça para manter as skills apontadas
+        -- ao NPC; usa torso/root como fallback para rigs diferentes.
+        local head = model:FindFirstChild("Head")
+        if head and head:IsA("BasePart") then
+            return head.Position
         end
-        return root.Position + Vector3.new(0, 1.5, 0)
+        local upperTorso = model:FindFirstChild("UpperTorso")
+        if upperTorso and upperTorso:IsA("BasePart") then
+            return upperTorso.Position + Vector3.new(0, math.clamp(upperTorso.Size.Y * 0.12, 0, 0.4), 0)
+        end
+        local torso = model:FindFirstChild("Torso")
+        if torso and torso:IsA("BasePart") then
+            return torso.Position + Vector3.new(0, math.clamp(torso.Size.Y * 0.12, 0, 0.4), 0)
+        end
+        local root = getModelRoot(model)
+        if root then return root.Position + Vector3.new(0, 1.1, 0) end
+        return nil
     end
 
     local function findNearestMob(origin)
@@ -7889,36 +7904,42 @@ do
 
     local function onRenderStep(dt)
         if not AutoRaidAssist.Enabled then return end
-        local aimPosition = getAimPosition(AutoRaidAssist.Target)
+
+        -- No Auto Raid V2, mira no alvo real do loop, inclusive durante a recuperação
+        -- a 100 studs. No Auto Raid normal, acompanha o NPC próximo escolhido pelo assist.
+        local aimModel = AutoRaidV2.Enabled and AutoRaidV2.Target or AutoRaidAssist.Target
+        local aimPosition = getAimPosition(aimModel)
         if not aimPosition then
             restoreBodyFacing()
             return
         end
 
-        -- Além de apontar a câmera como antes, vira suavemente o corpo do jogador
-        -- para ficar de frente para o NPC acompanhado pela assistência.
-        faceCharacterToward(aimPosition, dt)
+        -- O modo Above fixa a pose do Auto Raid; evita disputar a rotação do corpo,
+        -- mas a assistência de câmera e cursor permanece ativa.
+        if not (AutoRaid.Enabled and AutoRaid.PositionMode == "Above") then
+            faceCharacterToward(aimPosition, dt)
+        else
+            restoreBodyFacing()
+        end
 
         local cam = workspace.CurrentCamera
         if not cam then return end
 
-        -- Assistência de mira separada: só acompanha mobs válidos e não controla o voo.
+        -- Mesma curva rápida de mira do Auto Raid V2, independente do FPS.
         local current = cam.CFrame
         local desired = CFrame.lookAt(current.Position, aimPosition)
-        local alpha = math.clamp((dt or 1 / 60) * 16, 0, 1)
+        local frameDt = math.clamp(dt or (1 / 60), 1 / 240, 1 / 15)
+        local alpha = 1 - math.exp(-RAID_AIM_LERP_SPEED * frameDt)
         cam.CFrame = current:Lerp(desired, alpha)
 
-        local now = os.clock()
-        if now - lastMouseMove >= 0.08 then
-            local screenPoint, onScreen = cam:WorldToViewportPoint(aimPosition)
-            if onScreen and screenPoint.Z > 0 then
-                pcall(function()
-                    VirtualInputManager:SendMouseMoveEvent(
-                        math.floor(screenPoint.X), math.floor(screenPoint.Y), game
-                    )
-                end)
-                lastMouseMove = now
-            end
+        -- Mantém o cursor real colado no ponto de mira a cada frame, como no V2.
+        local screenPoint, onScreen = cam:WorldToViewportPoint(aimPosition)
+        if onScreen and screenPoint.Z > 0 then
+            pcall(function()
+                VirtualInputManager:SendMouseMoveEvent(
+                    math.floor(screenPoint.X + 0.5), math.floor(screenPoint.Y + 0.5), game
+                )
+            end)
         end
     end
 
@@ -7928,7 +7949,6 @@ do
         AutoRaidAssist.Token = AutoRaidAssist.Token + 1
         local token = AutoRaidAssist.Token
         AutoRaidAssist.Target = nil
-        lastMouseMove = 0
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
         RunService:BindToRenderStep(STEER_NAME, Enum.RenderPriority.Camera.Value + 3, onRenderStep)
 
@@ -7936,21 +7956,29 @@ do
             while AutoRaidAssist.Enabled and AutoRaidAssist.Token == token do
                 local root = getCharacterRoot()
                 if root then
-                    local candidate, candidateDistance = findNearestMob(root.Position)
-                    local current = AutoRaidAssist.Target
-                    local currentRoot = getModelRoot(current)
-                    local currentDistance = currentRoot and (currentRoot.Position - root.Position).Magnitude or math.huge
-                    -- Evita troca nervosa quando dois mobs estão praticamente à mesma distância.
-                    if candidate and (not isValidAimMob(current) or candidate == current
-                        or candidateDistance + 3 < currentDistance) then
-                        AutoRaidAssist.Target = candidate
-                    elseif not isValidAimMob(current) then
-                        AutoRaidAssist.Target = candidate
+                    if AutoRaidV2.Enabled then
+                        -- No V2 não troca o alvo durante combate/recuperação de vida.
+                        local currentTarget = AutoRaidV2.Target
+                        AutoRaidAssist.Target = isValidAimMob(currentTarget) and currentTarget or nil
+                    elseif AutoRaid.Enabled then
+                        local candidate, candidateDistance = findNearestMob(root.Position)
+                        local current = AutoRaidAssist.Target
+                        local currentRoot = getModelRoot(current)
+                        local currentDistance = currentRoot and (currentRoot.Position - root.Position).Magnitude or math.huge
+                        -- Evita troca nervosa quando dois mobs estão praticamente à mesma distância.
+                        if candidate and (not isValidAimMob(current) or candidate == current
+                            or candidateDistance + 3 < currentDistance) then
+                            AutoRaidAssist.Target = candidate
+                        elseif not isValidAimMob(current) then
+                            AutoRaidAssist.Target = candidate
+                        end
+                    else
+                        AutoRaidAssist.Target = nil
                     end
                 else
                     AutoRaidAssist.Target = nil
                 end
-                task.wait(0.65)
+                task.wait(AutoRaidV2.Enabled and 0.10 or 0.50)
             end
             AutoRaidAssist.Thread = nil
         end)
@@ -7971,6 +7999,19 @@ do
 
     AutoRaidAssist.Start = startAssist
     AutoRaidAssist.Stop = stopAssist
+end
+
+-- A mira é interna: ativa automaticamente com qualquer modo Raid e só encerra
+-- quando Auto Raid e Auto Raid V2 estiverem ambos desligados.
+startRaidAimAssist = function()
+    if AutoRaidAssist and AutoRaidAssist.Start then AutoRaidAssist.Start() end
+end
+
+stopRaidAimAssist = function()
+    if not AutoRaid.Enabled and not AutoRaidV2.Enabled
+        and AutoRaidAssist and AutoRaidAssist.Stop then
+        AutoRaidAssist.Stop()
+    end
 end
 
 --// ==========================================
@@ -8161,38 +8202,7 @@ do
     -- Auto Raid V2: trava a assistência no alvo atual, com prioridade à cabeça.
     -- A rotação é deliberadamente rápida para manter as habilidades apontadas ao NPC,
     -- mas continua interpolada para evitar saltos bruscos de câmera.
-    local AIM_ASSIST_LERP_SPEED = 60
-
-    local function getV2AimPosition(model, fallbackRoot)
-        if model and model.Parent then
-            local head = model:FindFirstChild("Head")
-            if head and head:IsA("BasePart") then
-                -- O centro da cabeça costuma ser um ponto mais consistente para skills.
-                return head.Position
-            end
-
-            local upperTorso = model:FindFirstChild("UpperTorso")
-            if upperTorso and upperTorso:IsA("BasePart") then
-                return upperTorso.Position + Vector3.new(0, math.clamp(upperTorso.Size.Y * 0.12, 0, 0.4), 0)
-            end
-
-            local torso = model:FindFirstChild("Torso")
-            if torso and torso:IsA("BasePart") then
-                return torso.Position + Vector3.new(0, math.clamp(torso.Size.Y * 0.12, 0, 0.4), 0)
-            end
-
-            local humanoidRoot = model:FindFirstChild("HumanoidRootPart")
-            if humanoidRoot and humanoidRoot:IsA("BasePart") then
-                return humanoidRoot.Position + Vector3.new(0, 1.1, 0)
-            end
-        end
-        if fallbackRoot and fallbackRoot.Parent then
-            return fallbackRoot.Position + Vector3.new(0, 1.1, 0)
-        end
-        return nil
-    end
-
-    local function onRenderStep(dt)
+    local function onRenderStep()
         if not AutoRaidV2.Enabled then return end
         local _, hum, root = getCharacter()
         if not (hum and root) then
@@ -8200,55 +8210,14 @@ do
             return
         end
 
+        -- A assistência de câmera/cursor é compartilhada com o Auto Raid normal e
+        -- continua focando AutoRaidV2.Target durante a recuperação, mesmo sem steerPart.
         local part = steerPart
         if moving and part and part.Parent then
             applyDistanceControl(hum, root, part)
         else
             pcall(function() hum:Move(Vector3.zero, false) end)
             restoreRaidWalkSpeed()
-        end
-
-        if not (part and part.Parent) then return end
-        local cam = workspace.CurrentCamera
-        if not cam then return end
-
-        local cf = cam.CFrame
-        local targetPosition = part.Position
-        local targetModel = AutoRaidV2.Target
-        local fullAimPosition = getV2AimPosition(targetModel, part)
-        local desired
-
-        if fullAimPosition then
-            -- Mantém a mira presa ao NPC ativo em todo o percurso do Auto Raid V2,
-            -- não apenas nos últimos 12 studs. O alvo não é trocado por outro NPC.
-            desired = CFrame.lookAt(cf.Position, fullAimPosition)
-        else
-            -- Fallback defensivo: direciona para a raiz do alvo atual caso o modelo
-            -- ainda esteja carregando alguma parte do corpo.
-            local flat = Vector3.new(targetPosition.X - root.Position.X, 0, targetPosition.Z - root.Position.Z)
-            if flat.Magnitude <= 0.05 then return end
-            desired = CFrame.lookAt(cf.Position, targetPosition)
-        end
-
-        -- Interpolação exponencial independente da taxa de quadros: gira rapidamente
-        -- para acompanhar a cabeça do NPC sem recriar tarefas de mira.
-        local frameDt = math.clamp(dt or (1 / 60), 1 / 240, 1 / 15)
-        local alpha = 1 - math.exp(-AIM_ASSIST_LERP_SPEED * frameDt)
-        cam.CFrame = cf:Lerp(desired, alpha)
-
-        -- Mantém também o cursor real alinhado ao ponto de mira do NPC. A posição
-        -- é recalculada depois de atualizar a câmera, para que o cursor acompanhe
-        -- alvos em movimento e volte ao alvo se o usuário mover o mouse.
-        local cursorAimPosition = fullAimPosition or targetPosition
-        if cursorAimPosition then
-            local projected, onScreen = cam:WorldToViewportPoint(cursorAimPosition)
-            if onScreen and projected.Z > 0 then
-                local mouseX = math.floor(projected.X + 0.5)
-                local mouseY = math.floor(projected.Y + 0.5)
-                pcall(function()
-                    VirtualInputManager:SendMouseMoveEvent(mouseX, mouseY, game)
-                end)
-            end
         end
     end
 
@@ -8329,6 +8298,8 @@ do
         AutoRaidV2.Enabled = true
         AutoRaidV2.Token = AutoRaidV2.Token + 1
         local token = AutoRaidV2.Token
+        CombatCfg.AutoSkillPausedForRaidRecovery = false
+        if startRaidAimAssist then startRaidAimAssist() end
         AutoRaidV2.Target = nil
         AutoRaidV2.Status = "procurando NPCs"
         recovering = false
@@ -8367,7 +8338,8 @@ do
                 if not (char and hum and root) then
                     setMoving(false)
                     steerPart = nil
-                    -- A respawn invalidates the old avatar's recovery positions.
+                    -- Respawn encerra a recuperação do personagem antigo; não deixa Skills pausadas.
+                    CombatCfg.AutoSkillPausedForRaidRecovery = false
                     recovering = false
                     recoverySafeCFrame = nil
                     recoveryReturnCFrame = nil
@@ -8380,6 +8352,8 @@ do
                     -- At 30% health or lower, pause the raid and move to a safe point
                     -- roughly 100 studs above the ground. Keep the existing NPC queued.
                     if not recovering and healthRatio <= LOW_HEALTH_THRESHOLD then
+                        -- Pausa Auto Skills antes de subir ao ponto seguro a 100 studs do chão.
+                        CombatCfg.AutoSkillPausedForRaidRecovery = true
                         setMoving(false)
                         steerPart = nil
                         pcall(function() hum:MoveTo(root.Position) end)
@@ -8406,6 +8380,7 @@ do
                             recovering = false
                             recoverySafeCFrame = nil
                             recoveryReturnCFrame = nil
+                            CombatCfg.AutoSkillPausedForRaidRecovery = false
                             AutoRaidV2.Status = "vida recuperada; voltando aos NPCs"
                             task.wait(0.25)
                         else
@@ -8519,6 +8494,7 @@ do
         recovering = false
         recoverySafeCFrame = nil
         recoveryReturnCFrame = nil
+        CombatCfg.AutoSkillPausedForRaidRecovery = false
         if AutoRaidV2.Thread then
             pcall(task.cancel, AutoRaidV2.Thread)
             AutoRaidV2.Thread = nil
@@ -8528,6 +8504,7 @@ do
             spawnConnection = nil
         end
         pcall(function() RunService:UnbindFromRenderStep(STEER_NAME) end)
+        if stopRaidAimAssist then stopRaidAimAssist() end
         local _, hum, root = getCharacter()
         if hum and root then
             pcall(function() hum:MoveTo(root.Position) end)
@@ -8686,21 +8663,36 @@ do
 
         CombatCfg.SkillThread = task.spawn(function()
             while CombatCfg.AutoSkillEnabled do
-                local cycleStart = os.clock()
+                if CombatCfg.AutoSkillPausedForRaidRecovery then
+                    -- Espera enquanto o personagem está no ponto de recuperação; este
+                    -- mesmo thread retoma o uso das skills depois do retorno ao chão.
+                    CombatCfg.SkillBusy = false
+                    task.wait(0.10)
+                else
+                    local cycleStart = os.clock()
 
-                for _, data in ipairs(SKILL_KEYS) do
-                    if not CombatCfg.AutoSkillEnabled then break end
-                    if CombatCfg.SelectedSkills[data.Key] then
-                        CombatCfg.SkillBusy = true
-                        pressKey(data.Key)
-                        task.wait(CombatCfg.SkillKeyGap)
+                    for _, data in ipairs(SKILL_KEYS) do
+                        if not CombatCfg.AutoSkillEnabled or CombatCfg.AutoSkillPausedForRaidRecovery then
+                            break
+                        end
+                        if CombatCfg.SelectedSkills[data.Key] then
+                            CombatCfg.SkillBusy = true
+                            pressKey(data.Key)
+                            if not CombatCfg.AutoSkillPausedForRaidRecovery then
+                                task.wait(CombatCfg.SkillKeyGap)
+                            end
+                        end
+                    end
+
+                    CombatCfg.SkillBusy = false
+
+                    if CombatCfg.AutoSkillPausedForRaidRecovery then
+                        task.wait(0.10)
+                    else
+                        local remaining = CombatCfg.SkillInterval - (os.clock() - cycleStart)
+                        task.wait(math.max(remaining, 0.05))
                     end
                 end
-
-                CombatCfg.SkillBusy = false
-
-                local remaining = CombatCfg.SkillInterval - (os.clock() - cycleStart)
-                task.wait(math.max(remaining, 0.05))
             end
 
             CombatCfg.SkillBusy = false
@@ -9155,10 +9147,9 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v2.1", "+ Auto Farm Improvements", 70)
-createUpdateCard(HomePage, 3, "v2.0", "+Assistencia de Mira Melhorada do Auto Raid V2 ( Skilss teleguiadas )", 86)
-createUpdateCard(HomePage, 4, "v1.95", "+ Grande Otimização no UI", 70)
-createUpdateCard(HomePage, 5, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
+createUpdateCard(HomePage, 2, "v2.15", "+ Improvements to Auto Raid and Auto Raid V2", 78)
+createUpdateCard(HomePage, 3, "v2.1", "+ Auto Farm Improvements", 70)
+createUpdateCard(HomePage, 4, "v2.0", "+ Improved Auto Raid V2 Aim Assist (Homing Skills)", 86)
 end --// ABA HOME (Changelog)
 
 --// ==========================================
@@ -9649,7 +9640,6 @@ setAutoRaid, getAutoRaid = createToggleCard(
     function(state)
         if state then
             if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
-            if getAutoRaidAssist and getAutoRaidAssist() then setAutoRaidAssist(false) else AutoRaidAssist.Stop() end
             -- Evita que os outros sistemas de deslocamento disputem o controle do personagem.
             if getAutoMob and getAutoMob() then setAutoMob(false) end
             if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
@@ -9669,9 +9659,8 @@ setAutoRaidV2, getAutoRaidV2 = createToggleCard(
     false,
     function(state)
         if state then
-            -- A V2 caminha até um NPC por vez e não deve competir com a V1/mira automática.
+            -- A V2 é exclusiva da V1; a assistência interna seguirá o alvo atual da V2.
             if getAutoRaid and getAutoRaid() then setAutoRaid(false) end
-            if getAutoRaidAssist and getAutoRaidAssist() then setAutoRaidAssist(false) else AutoRaidAssist.Stop() end
             if getAutoMob and getAutoMob() then setAutoMob(false) end
             if getAutoMiner and getAutoMiner() then setAutoMiner(false) end
             if getAutoWood and getAutoWood() then setAutoWood(false) end
@@ -9746,22 +9735,6 @@ AutoRaidNormalButton.MouseButton1Click:Connect(function()
     renderAutoRaidPositionButtons()
 end)
 renderAutoRaidPositionButtons()
-
---// Assistência de mira independente do Auto Raid
-setAutoRaidAssist, getAutoRaidAssist = createToggleCard(
-    AutoRaidPage,
-    4,
-    "Assistência de Mira",
-    false,
-    function(state)
-        if state then
-            if getAutoRaidV2 and getAutoRaidV2() then setAutoRaidV2(false) end
-            AutoRaidAssist.Start()
-        else
-            AutoRaidAssist.Stop()
-        end
-    end
-)
 
 --// Controle de distância do Auto Raid (30 a 100 studs)
 local AutoRaidDistanceCard = Instance.new("Frame")
