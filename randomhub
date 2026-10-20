@@ -350,8 +350,8 @@ local AutoRaid = {
     Stop = nil,
     Target = nil,
     AimPosition = nil,
-    HoverHeight = 40, -- altura de teleporte acima do chão detectado
-    PositionMode = "Above", -- "Above" (deitado/voltado para baixo) ou "Normal" (postura padrão)
+    HoverHeight = 55, -- Safe Zone em studs, compartilhada com Auto Raid e Auto Raid V2
+    PositionMode = "Normal", -- postura normal fixa; seletor removido
     Status = "desligado",
 }
 
@@ -7662,26 +7662,18 @@ do
         end
     end
 
-    local function setPositionMode(mode)
-        if mode ~= "Above" and mode ~= "Normal" then return end
-        AutoRaid.PositionMode = mode
+    local function setPositionMode(_mode)
+        -- Compatibilidade interna: a postura do Auto Raid fica sempre Normal.
+        AutoRaid.PositionMode = "Normal"
         if activeRoot and activeRoot.Parent and activeHumanoid and activeHumanoid.Parent then
-            local configuredCFrame = getConfiguredFacingCFrame(activeRoot)
+            local configuredCFrame = getNormalFacingCFrame(activeRoot)
             if bodyGyro and bodyGyro.Parent == activeRoot then
                 bodyGyro.CFrame = configuredCFrame
             end
             pcall(function()
-                if mode == "Above" then
-                    activeHumanoid.AutoRotate = false
-                    activeHumanoid.PlatformStand = true
-                    activeHumanoid:ChangeState(Enum.HumanoidStateType.Physics)
-                    activeRoot.CFrame = configuredCFrame
-                    activeRoot.AssemblyAngularVelocity = Vector3.zero
-                else
-                    activeHumanoid.PlatformStand = false
-                    activeHumanoid.AutoRotate = true
-                    activeHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-                end
+                activeHumanoid.PlatformStand = false
+                activeHumanoid.AutoRotate = true
+                activeHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
             end)
         end
     end
@@ -7906,7 +7898,7 @@ do
         if not AutoRaidAssist.Enabled then return end
 
         -- No Auto Raid V2, mira no alvo real do loop, inclusive durante a recuperação
-        -- a 100 studs. No Auto Raid normal, acompanha o NPC próximo escolhido pelo assist.
+        -- na altura definida pelo slider. No Auto Raid normal, acompanha o NPC próximo escolhido pelo assist.
         local aimModel = AutoRaidV2.Enabled and AutoRaidV2.Target or AutoRaidAssist.Target
         local aimPosition = getAimPosition(aimModel)
         if not aimPosition then
@@ -8034,9 +8026,10 @@ do
     local recovering = false
     local recoverySafeCFrame = nil
     local recoveryReturnCFrame = nil
+    local recoveryHeightApplied = nil
     local LOW_HEALTH_THRESHOLD = 0.30
     local RECOVER_HEALTH_THRESHOLD = 0.80
-    local RECOVERY_HEIGHT = 100
+    -- A altura segura é controlada pelo slider da aba Auto Raid.
 
     local function isActive(token)
         return AutoRaidV2.Enabled and AutoRaidV2.Token == token
@@ -8069,7 +8062,7 @@ do
 
         local rotation = root.CFrame.Rotation
         local returnPosition = groundPosition + Vector3.new(0, 3.5, 0)
-        local safePosition = groundPosition + Vector3.new(0, RECOVERY_HEIGHT, 0)
+        local safePosition = groundPosition + Vector3.new(0, AutoRaid.HoverHeight, 0)
         return CFrame.new(safePosition) * rotation, CFrame.new(returnPosition) * rotation
     end
 
@@ -8305,6 +8298,7 @@ do
         recovering = false
         recoverySafeCFrame = nil
         recoveryReturnCFrame = nil
+        recoveryHeightApplied = nil
         steerPart = nil
         setMoving(false)
 
@@ -8343,21 +8337,23 @@ do
                     recovering = false
                     recoverySafeCFrame = nil
                     recoveryReturnCFrame = nil
+                    recoveryHeightApplied = nil
                     AutoRaidV2.Status = "aguardando seu personagem"
                     task.wait(0.25)
                 else
                     local now = os.clock()
                     local healthRatio = hum.MaxHealth > 0 and (hum.Health / hum.MaxHealth) or 1
 
-                    -- At 30% health or lower, pause the raid and move to a safe point
-                    -- roughly 100 studs above the ground. Keep the existing NPC queued.
+                    -- At 30% health or lower, pause the raid and move to the safe height selected
+                    -- with the Auto Raid slider. Keep the existing NPC queued.
                     if not recovering and healthRatio <= LOW_HEALTH_THRESHOLD then
-                        -- Pausa Auto Skills antes de subir ao ponto seguro a 100 studs do chão.
+                        -- Pausa Auto Skills antes de subir ao ponto seguro configurado na aba Auto Raid.
                         CombatCfg.AutoSkillPausedForRaidRecovery = true
                         setMoving(false)
                         steerPart = nil
                         pcall(function() hum:MoveTo(root.Position) end)
                         recoverySafeCFrame, recoveryReturnCFrame = findRecoveryCFrames(char, root)
+                        recoveryHeightApplied = AutoRaid.HoverHeight
                         recovering = true
                         zeroCharacterVelocity(root)
                         pcall(function() root.CFrame = recoverySafeCFrame end)
@@ -8370,6 +8366,16 @@ do
                         steerPart = nil
                         pcall(function() hum:MoveTo(root.Position) end)
 
+                        -- A alteração do slider durante a recuperação é aplicada em tempo real.
+                        if recoverySafeCFrame and recoveryHeightApplied ~= AutoRaid.HoverHeight then
+                            local previousHeight = recoveryHeightApplied or AutoRaid.HoverHeight
+                            recoverySafeCFrame = recoverySafeCFrame
+                                + Vector3.new(0, AutoRaid.HoverHeight - previousHeight, 0)
+                            recoveryHeightApplied = AutoRaid.HoverHeight
+                            pcall(function() root.CFrame = recoverySafeCFrame end)
+                            zeroCharacterVelocity(root)
+                        end
+
                         if healthRatio >= RECOVER_HEALTH_THRESHOLD then
                             -- Return to the ground area and resume walking toward the same
                             -- NPC if it is still alive; the queue/target is deliberately kept.
@@ -8380,6 +8386,7 @@ do
                             recovering = false
                             recoverySafeCFrame = nil
                             recoveryReturnCFrame = nil
+                            recoveryHeightApplied = nil
                             CombatCfg.AutoSkillPausedForRaidRecovery = false
                             AutoRaidV2.Status = "vida recuperada; voltando aos NPCs"
                             task.wait(0.25)
@@ -8494,6 +8501,7 @@ do
         recovering = false
         recoverySafeCFrame = nil
         recoveryReturnCFrame = nil
+        recoveryHeightApplied = nil
         CombatCfg.AutoSkillPausedForRaidRecovery = false
         if AutoRaidV2.Thread then
             pcall(task.cancel, AutoRaidV2.Thread)
@@ -9672,71 +9680,7 @@ setAutoRaidV2, getAutoRaidV2 = createToggleCard(
     end
 )
 
---// Seletor de posição do Auto Raid: apenas Above e Normal.
-local AutoRaidPositionCard = Instance.new("Frame")
-AutoRaidPositionCard.Name = "AutoRaidPositionCard"
-AutoRaidPositionCard.Size = UDim2.new(1, 0, 0, 88)
-AutoRaidPositionCard.BackgroundColor3 = Theme.Card
-AutoRaidPositionCard.BorderSizePixel = 0
-AutoRaidPositionCard.LayoutOrder = 6
-AutoRaidPositionCard.Parent = AutoRaidPage
-addCorner(AutoRaidPositionCard, 14)
-addStroke(AutoRaidPositionCard, Theme.Stroke, 1, 0.5)
-addGradient(AutoRaidPositionCard, Theme.CardHover, Theme.Card, 90)
-
-local AutoRaidPositionTitle = Instance.new("TextLabel")
-AutoRaidPositionTitle.Name = "PositionTitle"
-AutoRaidPositionTitle.Size = UDim2.new(1, -32, 0, 22)
-AutoRaidPositionTitle.Position = UDim2.new(0, 16, 0, 8)
-AutoRaidPositionTitle.BackgroundTransparency = 1
-AutoRaidPositionTitle.Text = "Posição do personagem"
-AutoRaidPositionTitle.TextColor3 = Theme.Text
-AutoRaidPositionTitle.Font = Enum.Font.GothamBold
-AutoRaidPositionTitle.TextSize = 13
-AutoRaidPositionTitle.TextXAlignment = Enum.TextXAlignment.Left
-AutoRaidPositionTitle.Parent = AutoRaidPositionCard
-
-local function createAutoRaidPositionButton(name, label, xScale, xOffset, width)
-    local button = Instance.new("TextButton")
-    button.Name = name
-    button.Size = UDim2.new(0.5, -22, 0, 34)
-    button.Position = UDim2.new(xScale, xOffset, 0, 42)
-    button.BackgroundColor3 = Theme.TrackOff
-    button.BorderSizePixel = 0
-    button.AutoButtonColor = false
-    button.Text = label
-    button.TextColor3 = Theme.Text
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 12
-    button.Parent = AutoRaidPositionCard
-    addCorner(button, 9)
-    addStroke(button, Theme.Stroke, 1, 0.4)
-    return button
-end
-
-local AutoRaidAboveButton = createAutoRaidPositionButton("AbovePositionButton", "Above", 0, 14, 0)
-local AutoRaidNormalButton = createAutoRaidPositionButton("NormalPositionButton", "Normal", 0.5, 8, 0)
-
-local function renderAutoRaidPositionButtons()
-    local aboveSelected = AutoRaid.PositionMode == "Above"
-    AutoRaidAboveButton.BackgroundColor3 = aboveSelected and Theme.Accent1 or Theme.TrackOff
-    AutoRaidNormalButton.BackgroundColor3 = (not aboveSelected) and Theme.Accent1 or Theme.TrackOff
-    AutoRaidAboveButton.TextColor3 = aboveSelected and Color3.new(1, 1, 1) or Theme.Text
-    AutoRaidNormalButton.TextColor3 = (not aboveSelected) and Color3.new(1, 1, 1) or Theme.Text
-end
-
-AutoRaidAboveButton.MouseButton1Click:Connect(function()
-    AutoRaid.SetPositionMode("Above")
-    renderAutoRaidPositionButtons()
-end)
-
-AutoRaidNormalButton.MouseButton1Click:Connect(function()
-    AutoRaid.SetPositionMode("Normal")
-    renderAutoRaidPositionButtons()
-end)
-renderAutoRaidPositionButtons()
-
---// Controle de distância do Auto Raid (30 a 100 studs)
+--// Safe Zone do Auto Raid e do Auto Raid V2 (10 a 55 studs)
 local AutoRaidDistanceCard = Instance.new("Frame")
 AutoRaidDistanceCard.Name = "AutoRaidDistanceCard"
 AutoRaidDistanceCard.Size = UDim2.new(1, 0, 0, 88)
@@ -9753,7 +9697,7 @@ AutoRaidDistanceTitle.Name = "DistanceTitle"
 AutoRaidDistanceTitle.Size = UDim2.new(1, -32, 0, 22)
 AutoRaidDistanceTitle.Position = UDim2.new(0, 16, 0, 10)
 AutoRaidDistanceTitle.BackgroundTransparency = 1
-AutoRaidDistanceTitle.Text = "Distância: " .. tostring(AutoRaid.HoverHeight) .. " studs"
+AutoRaidDistanceTitle.Text = "Safe Zone: " .. tostring(AutoRaid.HoverHeight) .. " studs"
 AutoRaidDistanceTitle.TextColor3 = Theme.Text
 AutoRaidDistanceTitle.Font = Enum.Font.GothamBold
 AutoRaidDistanceTitle.TextSize = 13
@@ -9793,8 +9737,8 @@ AutoRaidDistanceKnob.Parent = AutoRaidDistanceBar
 addCorner(AutoRaidDistanceKnob, 8)
 addStroke(AutoRaidDistanceKnob, Theme.Accent1, 1, 0.1)
 
-local AUTO_RAID_DISTANCE_MIN = 30
-local AUTO_RAID_DISTANCE_MAX = 100
+local AUTO_RAID_DISTANCE_MIN = 10
+local AUTO_RAID_DISTANCE_MAX = 55
 local autoRaidDistanceDragging = false
 
 local function renderAutoRaidDistance()
@@ -9803,7 +9747,7 @@ local function renderAutoRaidDistance()
             / (AUTO_RAID_DISTANCE_MAX - AUTO_RAID_DISTANCE_MIN),
         0, 1
     )
-    AutoRaidDistanceTitle.Text = "Distância: " .. tostring(AutoRaid.HoverHeight) .. " studs"
+    AutoRaidDistanceTitle.Text = "Safe Zone: " .. tostring(AutoRaid.HoverHeight) .. " studs"
     AutoRaidDistanceFill.Size = UDim2.new(ratio, 0, 1, 0)
     AutoRaidDistanceKnob.Position = UDim2.new(ratio, 0, 0.5, 0)
 end
