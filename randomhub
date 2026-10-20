@@ -1,6 +1,6 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v1.95                    ║
+    ║                 RAMDOM HUB  v2.0                    ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
 
@@ -46,7 +46,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "1.95",
+    Version = "2.0",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -7931,27 +7931,32 @@ do
         return distance
     end
 
-    local AIM_ASSIST_DISTANCE = 12
-    local AIM_ASSIST_LERP_SPEED = 18
+    -- Auto Raid V2: trava a assistência no alvo atual, com prioridade à cabeça.
+    -- A rotação é deliberadamente rápida para manter as habilidades apontadas ao NPC,
+    -- mas continua interpolada para evitar saltos bruscos de câmera.
+    local AIM_ASSIST_LERP_SPEED = 60
 
     local function getV2AimPosition(model, fallbackRoot)
         if model and model.Parent then
-            -- Prioriza o torso para manter a mira no corpo do NPC, sem perseguir
-            -- partes decorativas ou extremidades que se movem muito.
-            local body = model:FindFirstChild("UpperTorso")
-                or model:FindFirstChild("Torso")
-            if body and body:IsA("BasePart") then
-                return body.Position + Vector3.new(0, math.clamp(body.Size.Y * 0.08, 0, 0.35), 0)
+            local head = model:FindFirstChild("Head")
+            if head and head:IsA("BasePart") then
+                -- O centro da cabeça costuma ser um ponto mais consistente para skills.
+                return head.Position
+            end
+
+            local upperTorso = model:FindFirstChild("UpperTorso")
+            if upperTorso and upperTorso:IsA("BasePart") then
+                return upperTorso.Position + Vector3.new(0, math.clamp(upperTorso.Size.Y * 0.12, 0, 0.4), 0)
+            end
+
+            local torso = model:FindFirstChild("Torso")
+            if torso and torso:IsA("BasePart") then
+                return torso.Position + Vector3.new(0, math.clamp(torso.Size.Y * 0.12, 0, 0.4), 0)
             end
 
             local humanoidRoot = model:FindFirstChild("HumanoidRootPart")
             if humanoidRoot and humanoidRoot:IsA("BasePart") then
                 return humanoidRoot.Position + Vector3.new(0, 1.1, 0)
-            end
-
-            local head = model:FindFirstChild("Head")
-            if head and head:IsA("BasePart") then
-                return head.Position - Vector3.new(0, 0.35, 0)
             end
         end
         if fallbackRoot and fallbackRoot.Parent then
@@ -7982,32 +7987,42 @@ do
 
         local cf = cam.CFrame
         local targetPosition = part.Position
-        local flat = Vector3.new(targetPosition.X - root.Position.X, 0, targetPosition.Z - root.Position.Z)
         local targetModel = AutoRaidV2.Target
         local fullAimPosition = getV2AimPosition(targetModel, part)
-        local targetDistance = (targetPosition - root.Position).Magnitude
         local desired
 
-        if fullAimPosition and targetDistance <= AIM_ASSIST_DISTANCE then
-            -- Assistência integrada do V2: dentro de 12 studs acompanha o torso
-            -- do NPC atualmente selecionado. Não procura nem troca para outros mobs.
+        if fullAimPosition then
+            -- Mantém a mira presa ao NPC ativo em todo o percurso do Auto Raid V2,
+            -- não apenas nos últimos 12 studs. O alvo não é trocado por outro NPC.
             desired = CFrame.lookAt(cf.Position, fullAimPosition)
-        elseif flat.Magnitude > 0.5 then
-            -- Fora do alcance próximo, preserva a direção horizontal de navegação
-            -- para manter a orientação em direção ao mesmo NPC.
-            local dir = flat.Unit
-            local pitch = math.clamp(cf.LookVector.Y, -0.5, 0.5)
-            local h = math.sqrt(1 - pitch * pitch)
-            local look = Vector3.new(dir.X * h, pitch, dir.Z * h)
-            desired = CFrame.lookAt(cf.Position, cf.Position + look)
         else
-            return
+            -- Fallback defensivo: direciona para a raiz do alvo atual caso o modelo
+            -- ainda esteja carregando alguma parte do corpo.
+            local flat = Vector3.new(targetPosition.X - root.Position.X, 0, targetPosition.Z - root.Position.Z)
+            if flat.Magnitude <= 0.05 then return end
+            desired = CFrame.lookAt(cf.Position, targetPosition)
         end
 
-        -- Suaviza a rotação para evitar trancos de câmera. A posição da câmera não
-        -- é alterada e o personagem continua se movendo pelo controle normal.
-        local alpha = math.clamp((dt or (1 / 60)) * AIM_ASSIST_LERP_SPEED, 0, 1)
+        -- Interpolação exponencial independente da taxa de quadros: gira rapidamente
+        -- para acompanhar a cabeça do NPC sem recriar tarefas de mira.
+        local frameDt = math.clamp(dt or (1 / 60), 1 / 240, 1 / 15)
+        local alpha = 1 - math.exp(-AIM_ASSIST_LERP_SPEED * frameDt)
         cam.CFrame = cf:Lerp(desired, alpha)
+
+        -- Mantém também o cursor real alinhado ao ponto de mira do NPC. A posição
+        -- é recalculada depois de atualizar a câmera, para que o cursor acompanhe
+        -- alvos em movimento e volte ao alvo se o usuário mover o mouse.
+        local cursorAimPosition = fullAimPosition or targetPosition
+        if cursorAimPosition then
+            local projected, onScreen = cam:WorldToViewportPoint(cursorAimPosition)
+            if onScreen and projected.Z > 0 then
+                local mouseX = math.floor(projected.X + 0.5)
+                local mouseY = math.floor(projected.Y + 0.5)
+                pcall(function()
+                    VirtualInputManager:SendMouseMoveEvent(mouseX, mouseY, game)
+                end)
+            end
+        end
     end
 
     local function enqueueFactory(token)
@@ -8913,8 +8928,9 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v1.95", "+ Grande Otimização no UI", 70)
-createUpdateCard(HomePage, 3, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
+createUpdateCard(HomePage, 2, "v2.0", "+Assistencia de Mira Melhorada do Auto Raid V2 ( Skilss teleguiadas )", 86)
+createUpdateCard(HomePage, 3, "v1.95", "+ Grande Otimização no UI", 70)
+createUpdateCard(HomePage, 4, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
 end --// ABA HOME (Changelog)
 
 --// ==========================================
