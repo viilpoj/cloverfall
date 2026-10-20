@@ -1,8 +1,11 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v2.15                   ║
+    ║                 RAMDOM HUB  v2.16                   ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
+
+    v2.16:
+      + Improved Auto Raid V2 Safe Zone
 
     v2.15:
       + Improvements to Auto Raid and Auto Raid V2
@@ -52,7 +55,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "2.15",
+    Version = "2.16",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -8031,6 +8034,110 @@ do
     local RECOVER_HEALTH_THRESHOLD = 0.80
     -- A altura segura é controlada pelo slider da aba Auto Raid.
 
+    -- Invisibilidade apenas visual/local enquanto o Auto Raid V2 está na Safe Zone.
+    -- Isso não altera a lógica de aggro do servidor; o jogo pode continuar mirando no jogador.
+    local recoveryStealth = {
+        Character = nil,
+        Records = setmetatable({}, { __mode = "k" }),
+        DescendantConnection = nil,
+    }
+
+    local function applyRecoveryStealthToObject(obj)
+        if not (obj and obj.Parent) or recoveryStealth.Records[obj] then return end
+        local record = nil
+
+        if obj:IsA("BasePart") then
+            record = { Kind = "BasePart", Value = obj.LocalTransparencyModifier }
+            recoveryStealth.Records[obj] = record
+            pcall(function() obj.LocalTransparencyModifier = 1 end)
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            record = { Kind = "Texture", Value = obj.Transparency }
+            recoveryStealth.Records[obj] = record
+            pcall(function() obj.Transparency = 1 end)
+        elseif obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
+            record = { Kind = "Gui", Value = obj.Enabled }
+            recoveryStealth.Records[obj] = record
+            pcall(function() obj.Enabled = false end)
+        elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam")
+            or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
+            record = { Kind = "Enabled", Value = obj.Enabled }
+            recoveryStealth.Records[obj] = record
+            pcall(function() obj.Enabled = false end)
+        elseif obj:IsA("Highlight") then
+            record = { Kind = "Highlight", Value = obj.Enabled }
+            recoveryStealth.Records[obj] = record
+            pcall(function() obj.Enabled = false end)
+        elseif obj:IsA("ForceField") then
+            record = { Kind = "ForceField", Value = obj.Visible }
+            recoveryStealth.Records[obj] = record
+            pcall(function() obj.Visible = false end)
+        elseif obj:IsA("Humanoid") then
+            record = {
+                Kind = "Humanoid",
+                DisplayDistanceType = obj.DisplayDistanceType,
+                NameDisplayDistance = obj.NameDisplayDistance,
+                HealthDisplayDistance = obj.HealthDisplayDistance,
+            }
+            recoveryStealth.Records[obj] = record
+            pcall(function()
+                obj.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+                obj.NameDisplayDistance = 0
+                obj.HealthDisplayDistance = 0
+            end)
+        end
+    end
+
+    local function restoreRecoveryStealth()
+        if recoveryStealth.DescendantConnection then
+            pcall(function() recoveryStealth.DescendantConnection:Disconnect() end)
+            recoveryStealth.DescendantConnection = nil
+        end
+
+        for obj, record in pairs(recoveryStealth.Records) do
+            if obj and obj.Parent and record then
+                pcall(function()
+                    if record.Kind == "BasePart" then
+                        obj.LocalTransparencyModifier = record.Value or 0
+                    elseif record.Kind == "Texture" then
+                        obj.Transparency = record.Value or 0
+                    elseif record.Kind == "Gui" or record.Kind == "Enabled"
+                        or record.Kind == "Highlight" then
+                        obj.Enabled = record.Value == true
+                    elseif record.Kind == "ForceField" then
+                        obj.Visible = record.Value == true
+                    elseif record.Kind == "Humanoid" then
+                        obj.DisplayDistanceType = record.DisplayDistanceType
+                        obj.NameDisplayDistance = record.NameDisplayDistance
+                        obj.HealthDisplayDistance = record.HealthDisplayDistance
+                    end
+                end)
+            end
+        end
+
+        recoveryStealth.Character = nil
+        recoveryStealth.Records = setmetatable({}, { __mode = "k" })
+    end
+
+    local function hideRecoveryCharacter(char)
+        if not (char and char.Parent) then return end
+        if recoveryStealth.Character ~= char then
+            restoreRecoveryStealth()
+            recoveryStealth.Character = char
+        end
+
+        -- Reaplica aos objetos atuais e também aos acessórios/efeitos adicionados depois.
+        for _, obj in ipairs(char:GetDescendants()) do
+            applyRecoveryStealthToObject(obj)
+        end
+        if not recoveryStealth.DescendantConnection then
+            recoveryStealth.DescendantConnection = char.DescendantAdded:Connect(function(obj)
+                if recoveryStealth.Character == char then
+                    applyRecoveryStealthToObject(obj)
+                end
+            end)
+        end
+    end
+
     local function isActive(token)
         return AutoRaidV2.Enabled and AutoRaidV2.Token == token
     end
@@ -8062,7 +8169,9 @@ do
 
         local rotation = root.CFrame.Rotation
         local returnPosition = groundPosition + Vector3.new(0, 3.5, 0)
-        local safePosition = groundPosition + Vector3.new(0, AutoRaid.HoverHeight, 0)
+        -- Auto Raid V2 uses the Safe Zone below the ground; Auto Raid normal
+        -- keeps its existing above-ground HoverHeight behavior in its own controller.
+        local safePosition = groundPosition - Vector3.new(0, AutoRaid.HoverHeight, 0)
         return CFrame.new(safePosition) * rotation, CFrame.new(returnPosition) * rotation
     end
 
@@ -8299,6 +8408,7 @@ do
         recoverySafeCFrame = nil
         recoveryReturnCFrame = nil
         recoveryHeightApplied = nil
+        restoreRecoveryStealth()
         steerPart = nil
         setMoving(false)
 
@@ -8332,6 +8442,7 @@ do
                 if not (char and hum and root) then
                     setMoving(false)
                     steerPart = nil
+                    restoreRecoveryStealth()
                     -- Respawn encerra a recuperação do personagem antigo; não deixa Skills pausadas.
                     CombatCfg.AutoSkillPausedForRaidRecovery = false
                     recovering = false
@@ -8355,6 +8466,7 @@ do
                         recoverySafeCFrame, recoveryReturnCFrame = findRecoveryCFrames(char, root)
                         recoveryHeightApplied = AutoRaid.HoverHeight
                         recovering = true
+                        hideRecoveryCharacter(char)
                         zeroCharacterVelocity(root)
                         pcall(function() root.CFrame = recoverySafeCFrame end)
                         zeroCharacterVelocity(root)
@@ -8370,7 +8482,7 @@ do
                         if recoverySafeCFrame and recoveryHeightApplied ~= AutoRaid.HoverHeight then
                             local previousHeight = recoveryHeightApplied or AutoRaid.HoverHeight
                             recoverySafeCFrame = recoverySafeCFrame
-                                + Vector3.new(0, AutoRaid.HoverHeight - previousHeight, 0)
+                                + Vector3.new(0, previousHeight - AutoRaid.HoverHeight, 0)
                             recoveryHeightApplied = AutoRaid.HoverHeight
                             pcall(function() root.CFrame = recoverySafeCFrame end)
                             zeroCharacterVelocity(root)
@@ -8387,6 +8499,7 @@ do
                             recoverySafeCFrame = nil
                             recoveryReturnCFrame = nil
                             recoveryHeightApplied = nil
+                            restoreRecoveryStealth()
                             CombatCfg.AutoSkillPausedForRaidRecovery = false
                             AutoRaidV2.Status = "vida recuperada; voltando aos NPCs"
                             task.wait(0.25)
@@ -8502,6 +8615,7 @@ do
         recoverySafeCFrame = nil
         recoveryReturnCFrame = nil
         recoveryHeightApplied = nil
+        restoreRecoveryStealth()
         CombatCfg.AutoSkillPausedForRaidRecovery = false
         if AutoRaidV2.Thread then
             pcall(task.cancel, AutoRaidV2.Thread)
@@ -9155,9 +9269,10 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v2.15", "+ Improvements to Auto Raid and Auto Raid V2", 78)
-createUpdateCard(HomePage, 3, "v2.1", "+ Auto Farm Improvements", 70)
-createUpdateCard(HomePage, 4, "v2.0", "+ Improved Auto Raid V2 Aim Assist (Homing Skills)", 86)
+createUpdateCard(HomePage, 2, "v2.16", "+ Improved Auto Raid V2 Safe Zone", 78)
+createUpdateCard(HomePage, 3, "v2.15", "+ Improvements to Auto Raid and Auto Raid V2", 78)
+createUpdateCard(HomePage, 4, "v2.1", "+ Auto Farm Improvements", 70)
+createUpdateCard(HomePage, 5, "v2.0", "+ Improved Auto Raid V2 Aim Assist (Homing Skills)", 86)
 end --// ABA HOME (Changelog)
 
 --// ==========================================
