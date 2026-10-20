@@ -1,8 +1,11 @@
 --[[
     ╔══════════════════════════════════════════════════════╗
-    ║                 RAMDOM HUB  v2.0                    ║
+    ║                 RAMDOM HUB  v2.1                    ║
     ║ Combat, Home, Auto Farm, Auto Itens, Auto Raid, Fps Boost, Config ║
     ╚══════════════════════════════════════════════════════╝
+
+    v2.1:
+      + Auto Farm Improvements
 
     v1.95:
       + Grande Otimização no UI
@@ -46,7 +49,7 @@ end)
 
 --// Config
 local CONFIG = {
-    Version = "2.0",
+    Version = "2.1",
     UISize = UDim2.new(0, 600, 0, 460),
     UIOffset = UDim2.new(0.5, -300, 0.5, -230),
     UIScale = 1,
@@ -1097,17 +1100,21 @@ do
         LastStallRecoveryAt = -math.huge,
         RecoveryUntil = 0,
         RecoveryReturnStage = nil,
-        -- Desvio lateral ao detectar parede/peça física na trajetória horizontal.
+        -- Detecção da hitbox completa do obstáculo; em vez de desviar para o lado,
+        -- sobe acima do topo e só então atravessa a projeção horizontal do obstáculo.
         ObstacleRayDistance = 6.0,
-        ObstacleSideProbeDistance = 7.0,
         ObstacleCheckInterval = 0.12,
-        ObstacleSidestepDuration = 0.5,
-        ObstacleSidestepCooldown = 0.45,
-        ObstacleSidestepUntil = 0,
-        ObstacleSidestepDirection = nil,
-        ObstacleSidestepReturnStage = nil,
+        ObstacleTopClearance = 4.0,
+        ObstacleVerticalTolerance = 1.0,
+        ObstaclePassMargin = 2.5,
+        -- Limita modelos-contêiner muito grandes (por exemplo, o mapa inteiro),
+        -- para não tratar a fase inteira como um único obstáculo.
+        ObstacleMaxModelExtent = 350,
+        ObstacleLocalClusterRadius = 80,
+        ObstacleBypassTopY = nil,
+        ObstaclePassDirection = nil,
+        ObstaclePassFarProjection = nil,
         NextObstacleCheckAt = 0,
-        ObstacleSideSign = 1,
     }
     local stopFlightMode
 
@@ -1165,9 +1172,9 @@ do
         flight.LastStallRecoveryAt = -math.huge
         flight.RecoveryUntil = 0
         flight.RecoveryReturnStage = nil
-        flight.ObstacleSidestepUntil = 0
-        flight.ObstacleSidestepDirection = nil
-        flight.ObstacleSidestepReturnStage = nil
+        flight.ObstacleBypassTopY = nil
+        flight.ObstaclePassDirection = nil
+        flight.ObstaclePassFarProjection = nil
         flight.NextObstacleCheckAt = 0
         local controlledRoot = flight.ControlledRoot
         if controlledRoot and controlledRoot.Parent then
@@ -1309,47 +1316,129 @@ do
         return nil
     end
 
+    -- Retorna o RaycastResult mais próximo da trajetória horizontal.
+    -- O resultado permite calcular o limite superior da hitbox completa, não só
+    -- a altura da peça específica que o raio atingiu.
     local function flightObstacleAhead(root, forward)
-        if forward.Magnitude < 0.01 then return false end
+        if forward.Magnitude < 0.01 then return nil end
+        forward = Vector3.new(forward.X, 0, forward.Z)
+        if forward.Magnitude < 0.01 then return nil end
+        forward = forward.Unit
         local side = Vector3.new(-forward.Z, 0, forward.X)
         local verticalOffsets = {-0.35, 0.35, 0.95}
         local lateralOffsets = {-0.45, 0, 0.45}
+        local nearestHit = nil
         for _, y in ipairs(verticalOffsets) do
             for _, lateral in ipairs(lateralOffsets) do
                 local origin = root.Position + Vector3.new(0, y, 0) + side * lateral
-                if raycastFlightObstacle(root, origin, forward, flight.ObstacleRayDistance) then
-                    return true
+                local hit = raycastFlightObstacle(root, origin, forward, flight.ObstacleRayDistance)
+                if hit and (not nearestHit or hit.Distance < nearestHit.Distance) then
+                    nearestHit = hit
                 end
             end
         end
-        return false
+        return nearestHit
     end
 
-    local function chooseFlightSidestep(root, forward)
-        local side = Vector3.new(-forward.Z, 0, forward.X)
-        if side.Magnitude < 0.01 then
-            local look = root.CFrame.LookVector
-            forward = Vector3.new(look.X, 0, look.Z)
-            if forward.Magnitude < 0.01 then forward = Vector3.new(0, 0, -1) end
-            forward = forward.Unit
-            side = Vector3.new(-forward.Z, 0, forward.X)
-        else
-            side = side.Unit
+    -- Mede topo e extremidade dianteira usando todas as BaseParts do Model
+    -- que contém a peça atingida. Para uma peça avulsa, usa a própria hitbox.
+    -- As projeções levam em conta a orientação da peça, não apenas Size.Y.
+    local function getFlightObstacleBounds(hitInstance, forward)
+        if not hitInstance then return nil end
+        forward = Vector3.new(forward.X, 0, forward.Z)
+        if forward.Magnitude < 0.01 then return nil end
+        forward = forward.Unit
+
+        local obstacleModel = nil
+        local ancestor = hitInstance
+        while ancestor and ancestor ~= workspace do
+            if ancestor:IsA("Model") and not ancestor:FindFirstChildOfClass("Humanoid") then
+                obstacleModel = ancestor
+                break
+            end
+            ancestor = ancestor.Parent
         end
 
-        local origin = root.Position + Vector3.new(0, 0.35, 0)
-        local leftBlocked = raycastFlightObstacle(root, origin, -side, flight.ObstacleSideProbeDistance) ~= nil
-        local rightBlocked = raycastFlightObstacle(root, origin, side, flight.ObstacleSideProbeDistance) ~= nil
+        local parts = {}
+        local useLocalCluster = false
+        if obstacleModel then
+            -- Reconhece contêineres que envolvam o mapa todo, sem somar toda a
+            -- geometria distante na hitbox local do obstáculo atingido.
+            local getBoxOk, modelBoxCFrame, modelBoxSize = pcall(function()
+                return obstacleModel:GetBoundingBox()
+            end)
+            if getBoxOk and modelBoxSize then
+                local largestExtent = math.max(modelBoxSize.X, modelBoxSize.Y, modelBoxSize.Z)
+                useLocalCluster = largestExtent > flight.ObstacleMaxModelExtent
+            end
 
-        -- Prefere o lado livre; se os dois lados parecerem livres/bloqueados, alterna
-        -- a direção entre tentativas para não insistir sempre no mesmo lado.
-        if leftBlocked and not rightBlocked then
-            return side
-        elseif rightBlocked and not leftBlocked then
-            return -side
+            local ok, descendants = pcall(function() return obstacleModel:GetDescendants() end)
+            if ok then
+                local hitPosition = hitInstance:IsA("BasePart") and hitInstance.Position
+                    or (modelBoxCFrame and modelBoxCFrame.Position)
+                for _, descendant in ipairs(descendants) do
+                    if descendant:IsA("BasePart") then
+                        local includePart = not useLocalCluster
+                        if useLocalCluster and hitPosition then
+                            local offset = descendant.Position - hitPosition
+                            local along = offset:Dot(forward)
+                            local perpendicular = offset - forward * along
+                            includePart = perpendicular.Magnitude <= flight.ObstacleLocalClusterRadius
+                                and along >= -flight.ObstacleLocalClusterRadius
+                                and along <= flight.ObstacleLocalClusterRadius
+                        end
+                        if includePart then
+                            table.insert(parts, descendant)
+                        end
+                    end
+                end
+            end
         end
-        flight.ObstacleSideSign = -(flight.ObstacleSideSign or 1)
-        return side * flight.ObstacleSideSign
+        if hitInstance:IsA("BasePart") then
+            local found = false
+            for _, part in ipairs(parts) do
+                if part == hitInstance then found = true break end
+            end
+            if not found then table.insert(parts, hitInstance) end
+        end
+
+        local topY = -math.huge
+        local farProjection = -math.huge
+        for _, part in ipairs(parts) do
+            if part and part.Parent then
+                local cf = part.CFrame
+                local size = part.Size
+                local verticalExtent = math.abs(cf.RightVector.Y) * size.X * 0.5
+                    + math.abs(cf.UpVector.Y) * size.Y * 0.5
+                    + math.abs(cf.LookVector.Y) * size.Z * 0.5
+                local partTop = part.Position.Y + verticalExtent
+                if partTop > topY then topY = partTop end
+
+                local forwardExtent = math.abs(cf.RightVector:Dot(forward)) * size.X * 0.5
+                    + math.abs(cf.UpVector:Dot(forward)) * size.Y * 0.5
+                    + math.abs(cf.LookVector:Dot(forward)) * size.Z * 0.5
+                local partFar = part.Position:Dot(forward) + forwardExtent
+                if partFar > farProjection then farProjection = partFar end
+            end
+        end
+
+        if topY == -math.huge or farProjection == -math.huge then
+            if hitInstance:IsA("BasePart") then
+                local cf, size = hitInstance.CFrame, hitInstance.Size
+                local verticalExtent = math.abs(cf.RightVector.Y) * size.X * 0.5
+                    + math.abs(cf.UpVector.Y) * size.Y * 0.5
+                    + math.abs(cf.LookVector.Y) * size.Z * 0.5
+                local forwardExtent = math.abs(cf.RightVector:Dot(forward)) * size.X * 0.5
+                    + math.abs(cf.UpVector:Dot(forward)) * size.Y * 0.5
+                    + math.abs(cf.LookVector:Dot(forward)) * size.Z * 0.5
+                topY = hitInstance.Position.Y + verticalExtent
+                farProjection = hitInstance.Position:Dot(forward) + forwardExtent
+            else
+                return nil
+            end
+        end
+
+        return topY, farProjection, obstacleModel
     end
 
     local function ensureFlightController()
@@ -1378,23 +1467,107 @@ do
             local stage = flight.Stage
             local now = os.clock()
 
-            -- Enquanto desvia, a velocidade é estritamente lateral: sem avanço e sem
-            -- subida/descida durante 0,5 segundo. Depois, retoma a etapa que estava ativa.
-            if stage == "DesviandoObstaculo" then
-                if now < (flight.ObstacleSidestepUntil or 0)
-                    and flight.ObstacleSidestepDirection then
-                    local sideDirection = flight.ObstacleSidestepDirection
-                    root.AssemblyLinearVelocity = Vector3.new(
-                        sideDirection.X * speed, 0, sideDirection.Z * speed)
+            -- Etapa 1 do obstáculo: sobe até ultrapassar o topo estimado de toda a
+            -- hitbox física do Model/peça detectada.
+            if stage == "SubindoAcimaObstaculo" then
+                local clearY = flight.ObstacleBypassTopY
+                if not clearY then
+                    flight.Stage = "DeslocandoHorizontalmente"
+                    stage = flight.Stage
+                elseif root.Position.Y >= clearY - flight.ObstacleVerticalTolerance then
+                    flight.Stage = "PassandoAcimaObstaculo"
+                    flight.StallCheckStage = nil
+                    flight.StallAnchorY = nil
+                    flight.StallProgressAt = nil
+                    flight.ControlledRoot = root
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    return
+                else
+                    if flight.CheckVerticalStall("SubindoAcimaObstaculo", true,
+                        root, targetRoot, speed) then
+                        return
+                    end
+                    local climbDelta = clearY - root.Position.Y
+                    local climbSpeed = math.min(speed, math.max(1, climbDelta * 4))
+                    root.AssemblyLinearVelocity = Vector3.new(0, climbSpeed, 0)
                     flight.ControlledRoot = root
                     return
                 end
+            end
 
-                stage = flight.ObstacleSidestepReturnStage or "DeslocandoHorizontalmente"
-                flight.Stage = stage
-                flight.ObstacleSidestepDirection = nil
-                flight.ObstacleSidestepReturnStage = nil
-                flight.NextObstacleCheckAt = now + flight.ObstacleSidestepCooldown
+            -- Etapa 2 do obstáculo: atravessa por cima mantendo a altitude livre.
+            -- Não há deslocamento lateral programado. Se surgir outro obstáculo mais
+            -- alto no trajeto, mede sua hitbox e sobe novamente antes de continuar.
+            if stage == "PassandoAcimaObstaculo" then
+                local passDirection = flight.ObstaclePassDirection
+                if not passDirection or passDirection.Magnitude < 0.01 then
+                    local targetDelta = Vector3.new(
+                        targetRoot.Position.X - root.Position.X, 0,
+                        targetRoot.Position.Z - root.Position.Z)
+                    if targetDelta.Magnitude < 0.01 then
+                        flight.ObstacleBypassTopY = nil
+                        flight.ObstaclePassDirection = nil
+                        flight.ObstaclePassFarProjection = nil
+                        flight.Stage = "DeslocandoHorizontalmente"
+                        flight.ControlledRoot = root
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        return
+                    end
+                    passDirection = targetDelta.Unit
+                    flight.ObstaclePassDirection = passDirection
+                end
+
+                if now >= (flight.NextObstacleCheckAt or 0) then
+                    flight.NextObstacleCheckAt = now + flight.ObstacleCheckInterval
+                    local nextHit = flightObstacleAhead(root, passDirection)
+                    if nextHit then
+                        local nextTop, nextFar = getFlightObstacleBounds(nextHit.Instance, passDirection)
+                        if nextTop and nextFar then
+                            local neededY = nextTop + flight.ObstacleTopClearance
+                            if neededY > (flight.ObstacleBypassTopY or root.Position.Y)
+                                + flight.ObstacleVerticalTolerance then
+                                flight.ObstacleBypassTopY = neededY
+                                flight.ObstaclePassFarProjection = math.max(
+                                    flight.ObstaclePassFarProjection or -math.huge, nextFar)
+                                flight.Stage = "SubindoAcimaObstaculo"
+                                flight.StallCheckStage = nil
+                                flight.StallAnchorY = nil
+                                flight.StallProgressAt = nil
+                                flight.ControlledRoot = root
+                                root.AssemblyLinearVelocity = Vector3.zero
+                                return
+                            else
+                                flight.ObstaclePassFarProjection = math.max(
+                                    flight.ObstaclePassFarProjection or -math.huge, nextFar)
+                            end
+                        end
+                    end
+                end
+
+                local farProjection = flight.ObstaclePassFarProjection
+                local currentProjection = root.Position:Dot(passDirection)
+                if farProjection and currentProjection >= farProjection + flight.ObstaclePassMargin then
+                    flight.ObstacleBypassTopY = nil
+                    flight.ObstaclePassDirection = nil
+                    flight.ObstaclePassFarProjection = nil
+                    flight.NextObstacleCheckAt = now + 0.3
+                    flight.Stage = "DeslocandoHorizontalmente"
+                    flight.ControlledRoot = root
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    return
+                end
+
+                local holdY = flight.ObstacleBypassTopY or root.Position.Y
+                local verticalError = holdY - root.Position.Y
+                local verticalSpeed = math.clamp(verticalError * 4,
+                    -speed * 0.2, speed * 0.2)
+                local distanceToEdge = farProjection
+                    and math.max(1, farProjection + flight.ObstaclePassMargin - currentProjection) or 6
+                local forwardSpeed = math.min(speed, math.max(2, distanceToEdge * 2))
+                root.AssemblyLinearVelocity = Vector3.new(
+                    passDirection.X * forwardSpeed, verticalSpeed, passDirection.Z * forwardSpeed)
+                flight.ControlledRoot = root
+                return
             end
 
             -- Recuperação temporária de avanço quando a altitude não progride; é distinta
@@ -1474,20 +1647,34 @@ do
                     return
                 end
 
-                -- Se houver peça física na direção do alvo, desvia somente para um
-                -- dos lados por 0,5 segundo, sem componente de velocidade para frente.
+                -- Se detectar um obstáculo à frente, mede a altura e a extremidade
+                -- da hitbox inteira. Primeiro sobe acima do topo; depois cruza por cima.
                 if now >= (flight.NextObstacleCheckAt or 0) and horizontalDistance > flight.HorizontalTolerance then
                     flight.NextObstacleCheckAt = now + flight.ObstacleCheckInterval
-                    if flightObstacleAhead(root, delta.Unit) then
-                        flight.ObstacleSidestepDirection = chooseFlightSidestep(root, delta.Unit)
-                        flight.ObstacleSidestepReturnStage = "DeslocandoHorizontalmente"
-                        flight.ObstacleSidestepUntil = now + flight.ObstacleSidestepDuration
-                        flight.Stage = "DesviandoObstaculo"
-                        local sideDirection = flight.ObstacleSidestepDirection
-                        root.AssemblyLinearVelocity = Vector3.new(
-                            sideDirection.X * speed, 0, sideDirection.Z * speed)
-                        flight.ControlledRoot = root
-                        return
+                    local obstacleHit = flightObstacleAhead(root, delta.Unit)
+                    if obstacleHit then
+                        local obstacleTopY, farProjection = getFlightObstacleBounds(
+                            obstacleHit.Instance, delta.Unit)
+                        if obstacleTopY and farProjection then
+                            local requiredY = obstacleTopY + flight.ObstacleTopClearance
+                            flight.ObstacleBypassTopY = math.max(requiredY, root.Position.Y)
+                            flight.ObstaclePassDirection = delta.Unit.Unit
+                            flight.ObstaclePassFarProjection = farProjection
+                            flight.Stage = root.Position.Y < requiredY - flight.ObstacleVerticalTolerance
+                                and "SubindoAcimaObstaculo" or "PassandoAcimaObstaculo"
+                            flight.StallCheckStage = nil
+                            flight.StallAnchorY = nil
+                            flight.StallProgressAt = nil
+                            if flight.Stage == "SubindoAcimaObstaculo" then
+                                local climbDelta = requiredY - root.Position.Y
+                                root.AssemblyLinearVelocity = Vector3.new(0,
+                                    math.min(speed, math.max(1, climbDelta * 4)), 0)
+                            else
+                                root.AssemblyLinearVelocity = Vector3.zero
+                            end
+                            flight.ControlledRoot = root
+                            return
+                        end
                     end
                 end
 
@@ -1973,7 +2160,40 @@ do
         return isActive(token)
     end
 
-    local function onRenderStep()
+    -- Usa o mesmo comportamento de mira do Auto Raid V2: foco contínuo na cabeça
+    -- e reposicionamento do cursor real sobre o ponto de mira projetado na tela.
+    local AUTO_MOB_AIM_LERP_SPEED = 60
+
+    local function getAutoMobAimPosition(model, fallbackRoot)
+        if model and model.Parent then
+            local head = model:FindFirstChild("Head")
+            if head and head:IsA("BasePart") then
+                return head.Position
+            end
+
+            local upperTorso = model:FindFirstChild("UpperTorso")
+            if upperTorso and upperTorso:IsA("BasePart") then
+                return upperTorso.Position + Vector3.new(0, math.clamp(upperTorso.Size.Y * 0.12, 0, 0.4), 0)
+            end
+
+            local torso = model:FindFirstChild("Torso")
+            if torso and torso:IsA("BasePart") then
+                return torso.Position + Vector3.new(0, math.clamp(torso.Size.Y * 0.12, 0, 0.4), 0)
+            end
+
+            local humanoidRoot = model:FindFirstChild("HumanoidRootPart")
+            if humanoidRoot and humanoidRoot:IsA("BasePart") then
+                return humanoidRoot.Position + Vector3.new(0, 1.1, 0)
+            end
+        end
+
+        if fallbackRoot and fallbackRoot.Parent then
+            return fallbackRoot.Position + Vector3.new(0, 1.1, 0)
+        end
+        return nil
+    end
+
+    local function onRenderStep(dt)
         local part = steerPart
         if not (part and part.Parent) then return end
 
@@ -1983,34 +2203,41 @@ do
         local cam = workspace.CurrentCamera
         if not cam then return end
 
-        -- A assistência de mira fica restrita ao alvo atual que corresponde à
-        -- seleção do usuário e só entra quando ele está a 12 studs ou menos.
+        -- Auto Farm gruda a mira no alvo corrente, respeitando a lista de tipos
+        -- selecionados quando existir filtro. Sem filtro, segue o mob ativo do farm.
         local selectedMob = AutoMob.Target
-        if MOB_CFG.CloseRangeAimEnabled and selectedMob and mobAlive(selectedMob)
-            and hasSelection() and matchesSelection(selectedMob) then
+        local targetAllowed = MOB_CFG.CloseRangeAimEnabled
+            and selectedMob ~= nil and mobAlive(selectedMob)
+        if targetAllowed and hasSelection() and not matchesSelection(selectedMob) then
+            targetAllowed = false
+        end
+
+        if targetAllowed then
             local targetRoot = modelRoot(selectedMob)
-            if targetRoot then
-                local distance = (targetRoot.Position - root.Position).Magnitude
-                if distance <= MOB_CFG.CloseRangeAimDistance then
-                    local aimPart = selectedMob:FindFirstChild("UpperTorso")
-                        or selectedMob:FindFirstChild("Torso")
-                        or selectedMob:FindFirstChild("Head")
-                        or targetRoot
-                    if aimPart and aimPart:IsA("BasePart") then
-                        local aimPosition = aimPart.Position
-                        local direction = aimPosition - cam.CFrame.Position
-                        if direction.Magnitude > 0.1 then
-                            local desired = CFrame.lookAt(cam.CFrame.Position, aimPosition)
-                            cam.CFrame = cam.CFrame:Lerp(desired, MOB_CFG.CloseRangeAimLerp)
-                            return
-                        end
-                    end
+            local aimPosition = getAutoMobAimPosition(selectedMob, targetRoot)
+            if aimPosition then
+                local cf = cam.CFrame
+                local desired = CFrame.lookAt(cf.Position, aimPosition)
+                local frameDt = math.clamp(tonumber(dt) or (1 / 60), 1 / 240, 1 / 15)
+                local alpha = 1 - math.exp(-AUTO_MOB_AIM_LERP_SPEED * frameDt)
+                cam.CFrame = cf:Lerp(desired, alpha)
+
+                -- Mesmo mecanismo usado pelo Auto Raid V2 para colocar o cursor
+                -- sobre a cabeça/parte de mira do NPC, recalculado a cada frame.
+                local currentCamera = workspace.CurrentCamera or cam
+                local projected, onScreen = currentCamera:WorldToViewportPoint(aimPosition)
+                if onScreen and projected.Z > 0 then
+                    local mouseX = math.floor(projected.X + 0.5)
+                    local mouseY = math.floor(projected.Y + 0.5)
+                    pcall(function()
+                        VirtualInputManager:SendMouseMoveEvent(mouseX, mouseY, game)
+                    end)
                 end
+                return
             end
         end
 
-        -- Mantém o direcionamento horizontal usado para navegar até o mob; ele
-        -- não é a assistência de mira de curta distância acima.
+        -- Sem alvo válido, preserva a orientação horizontal original usada na navegação.
         local target = part.Position
         local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
         if flat.Magnitude > 0.5 then
@@ -8928,9 +9155,10 @@ DiscordBtn.MouseButton1Click:Connect(function()
     end
 end)
 
-createUpdateCard(HomePage, 2, "v2.0", "+Assistencia de Mira Melhorada do Auto Raid V2 ( Skilss teleguiadas )", 86)
-createUpdateCard(HomePage, 3, "v1.95", "+ Grande Otimização no UI", 70)
-createUpdateCard(HomePage, 4, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
+createUpdateCard(HomePage, 2, "v2.1", "+ Auto Farm Improvements", 70)
+createUpdateCard(HomePage, 3, "v2.0", "+Assistencia de Mira Melhorada do Auto Raid V2 ( Skilss teleguiadas )", 86)
+createUpdateCard(HomePage, 4, "v1.95", "+ Grande Otimização no UI", 70)
+createUpdateCard(HomePage, 5, "v1.9", "+ Adicionado Bypass Voo\n+ Melhoria no Auto Farm", 86)
 end --// ABA HOME (Changelog)
 
 --// ==========================================
